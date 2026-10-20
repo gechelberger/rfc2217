@@ -33,9 +33,11 @@ The first release, built on rfc2217 0.1.
     copied until it has been quiet for `--linger` seconds (default 1).
 - `rfc2217 pty TARGET` (Linux and macOS): the remote port as a local
   pseudo-terminal, optionally reachable through a `--link PATH` symlink that is
-  removed on exit. Changes that the program using the pty makes to the baud
-  rate, stop bits and flow control are picked up by polling about every 50 ms
-  and sent to the bridge.
+  removed on exit. Its path is printed on stdout once the bridge has answered.
+  Changes that the program using the pty makes to the baud rate, stop bits and
+  flow control are picked up by polling about every 50 ms and sent to the
+  bridge; with `--baud keep` the pty shows the bridge's rate. On Linux, the
+  port's data is dropped while no program has the pty open.
 - Line settings for both: `-b`/`--baud RATE|keep`, `-d`/`--data-bits 5-8`,
   `--parity none|odd|even|mark|space`, `--stop-bits 1|1.5|2`,
   `-f`/`--flow none|xonxoff|rtscts|dcd|dsr`, and `--frame` (`8N1`, `7E1`,
@@ -50,7 +52,8 @@ The first release, built on rfc2217 0.1.
   resolve or connect, 4 negotiation failed, 128+N stopped by signal N.
 - `-v`, `-vv` and `-vvv` for the bridge's events, the library's protocol debug
   logs and a trace of every exchange; `-q` for errors only. Messages and logs
-  go to stderr; stdout carries only the port's data.
+  go to stderr; stdout carries only the port's data (`connect`) or the pty's
+  path (`pty`).
 
 ### Behaviour worth knowing
 
@@ -73,7 +76,7 @@ The first release, built on rfc2217 0.1.
 - `pty`: data bits and parity come from the command line only (on Linux the
   pty driver forces 8 data bits and no parity); a pty has no DTR, RTS, BREAK
   or modem lines, so tools that reset a board through them do not work; it is
-  not paced by the baud rate.
+  not paced by the baud rate. On macOS it has not run on a Mac yet.
 - Windows: `connect` with piped or redirected input only, and no `pty`.
 - No `serve` (sharing a local serial port) and no reconnecting yet.
 

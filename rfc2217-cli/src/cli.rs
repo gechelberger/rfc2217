@@ -32,7 +32,7 @@ pub(crate) enum Command {
     /// pipe or file it copies the bytes both ways, unchanged.
     Connect(ConnectArgs),
     /// Expose a remote serial port as a local pseudo-terminal (Linux and
-    /// macOS).
+    /// macOS). Its path is printed on stdout once the bridge has answered.
     Pty(PtyArgs),
 }
 

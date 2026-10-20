@@ -4,7 +4,9 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
+#[cfg(test)]
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
@@ -108,7 +110,8 @@ impl Pty {
         &self.path
     }
 
-    /// The master end, for `poll` alongside the socket.
+    /// The master end, for tests that poll it.
+    #[cfg(test)]
     pub(crate) fn master(&self) -> BorrowedFd<'_> {
         self.master.as_fd()
     }
@@ -116,7 +119,10 @@ impl Pty {
     /// Switches the master between blocking and non-blocking reads and
     /// writes. Non-blocking, a write the program is too slow to take fails
     /// with [`io::ErrorKind::WouldBlock`] (a pty queues about 12 to 24 KiB
-    /// per direction) instead of stalling the writer.
+    /// per direction) instead of stalling the writer. The bridge keeps it
+    /// blocking: the engine pauses the socket's reader while the program is
+    /// slow, which a UART's paced receive cannot do.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
         let flags =
             rustix::fs::fcntl_getfl(&self.master).map_err(failed("reading the pty's flags"))?;
@@ -131,7 +137,9 @@ impl Pty {
     /// Drops what the bridge wrote and no program has read yet: the slave's
     /// input queue (`tcflush(TCIFLUSH)` through the held slave). Called when
     /// a program first opens the device, so it does not read bytes that
-    /// arrived for an earlier program or for nobody.
+    /// arrived for an earlier program or for nobody (Linux only: elsewhere
+    /// nothing tells when that is).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn flush_input(&self) -> io::Result<()> {
         termios::tcflush(&self.slave, QueueSelector::IFlush)
             .map_err(failed(format_args!("flushing {}", self.path.display())))

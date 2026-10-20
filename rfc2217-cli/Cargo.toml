@@ -45,7 +45,8 @@ missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 
-# The pty harness of tests/connect_tty.rs. Also a normal dependency, with the
-# same version: listed here so that the tests keep the features they use.
+# The pty harnesses of tests/connect_tty.rs and tests/pty.rs. Also a normal
+# dependency, with the same version: listed here so that the tests keep the
+# features they use.
 [target.'cfg(unix)'.dev-dependencies]
-rustix = { version = "1.1", features = ["fs", "process", "pty", "stdio", "termios"] }
+rustix = { version = "1.1", features = ["event", "fs", "process", "pty", "stdio", "termios"] }

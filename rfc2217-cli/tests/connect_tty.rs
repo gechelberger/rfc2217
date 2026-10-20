@@ -9,9 +9,9 @@
 //! keeps the CLI's messages out of the data.
 //!
 //! The last test sends a signal to a session without a terminal: it needs
-//! Unix too.
+//! Unix too. Linux and macOS only, as `pty`: the harness needs `ptsname`.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
 

@@ -22,15 +22,19 @@
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 use super::sys::Pty;
 
 const UNKNOWN: u8 = 0;
 const CLOSED: u8 = 1;
+// Only Linux's `OpenWatch` sees a program open the device.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const OPEN: u8 = 2;
 
 /// Whether a program has the device open, shared with the threads that write
@@ -54,6 +58,7 @@ impl Presence {
     }
 
     /// `Some(open)`, or `None` when it cannot be known.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn get(&self) -> Option<bool> {
         match self.0.load(Ordering::Acquire) {
             CLOSED => Some(false),
@@ -62,6 +67,7 @@ impl Presence {
         }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set(&self, state: u8) {
         self.0.store(state, Ordering::Release);
     }
@@ -69,6 +75,8 @@ impl Presence {
 
 /// A change in whether any program has the device open, from
 /// [`OpenWatch::wait`].
+// Only Linux's `OpenWatch` makes them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Transition {
     /// The first program opened the device; the input queue was flushed
@@ -97,13 +105,29 @@ pub(crate) enum Transition {
 /// on its open runs; there are few, since the flush on the last close
 /// already emptied the queue and the bridge drops data from then on. Only a
 /// write the bridge started just before seeing the close can be among them.
+///
+/// A thread of its own waits for the events ([`wait`](Self::wait)), and
+/// the pty's writer handles those already queued ([`update`](Self::update))
+/// before it drops data for a device counted as closed: the kernel queues
+/// a program's open before its `open` call returns, so before anything the
+/// program writes, and before the bridge's answer to that. Without this, a
+/// program that opens the device and sends a command at once could lose the
+/// answer whenever the watching thread is slow to run.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct OpenWatch {
     inotify: OwnedFd,
+    /// Taken while reading and handling events: the threads that do take
+    /// turns, so the events are counted in order.
+    count: Mutex<Count>,
+    presence: Presence,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct Count {
     opens: u32,
     lost: bool,
-    presence: Presence,
 }
 
 #[cfg(target_os = "linux")]
@@ -124,8 +148,7 @@ impl OpenWatch {
             .map_err(super::sys::failed(&what))?;
         Ok(Some(Self {
             inotify,
-            opens: 0,
-            lost: false,
+            count: Mutex::default(),
             presence: Presence(Arc::new(AtomicU8::new(CLOSED))),
         }))
     }
@@ -136,14 +159,15 @@ impl OpenWatch {
 
     /// Opens of the device by programs that have not closed it yet, as far
     /// as the events tell (see the type's documentation).
+    #[cfg(test)]
     pub(crate) fn opens(&self) -> u32 {
-        self.opens
+        self.lock().opens
     }
 
-    /// Readable when events are queued: for `poll` with other fds, then
-    /// [`wait`](Self::wait) with a zero timeout.
-    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
-        self.inotify.as_fd()
+    /// A panic anywhere ends the process, so a poisoned lock only means
+    /// that the thread holding it is gone.
+    fn lock(&self) -> MutexGuard<'_, Count> {
+        self.count.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Waits up to `timeout` (`None`: no limit) for opens and closes, and
@@ -155,12 +179,9 @@ impl OpenWatch {
     /// open; on the last close, the presence turns closed first. So nothing
     /// the bridge writes after seeing the device open is flushed. The last
     /// close also calls [`Pty::reset_after_close`]. A failed flush or reset
-    /// is a warning (`ui::warn`), not an error.
-    pub(crate) fn wait(
-        &mut self,
-        pty: &Pty,
-        timeout: Option<Duration>,
-    ) -> io::Result<Vec<Transition>> {
+    /// is a warning (`ui::warn`), not an error. An error ends the count: the
+    /// presence is unknown (counts as open) from then on.
+    pub(crate) fn wait(&self, pty: &Pty, timeout: Option<Duration>) -> io::Result<Vec<Transition>> {
         use rustix::event::{PollFd, PollFlags, Timespec};
         use rustix::io::Errno;
 
@@ -168,15 +189,38 @@ impl OpenWatch {
         let timeout = timeout.and_then(|t| Timespec::try_from(t).ok());
         let mut fds = [PollFd::new(&self.inotify, PollFlags::IN)];
         match rustix::event::poll(&mut fds, timeout.as_ref()) {
-            Ok(0) | Err(Errno::INTR) => return Ok(Vec::new()),
-            Ok(_) => {}
-            Err(e) => return Err(super::sys::failed("waiting for programs")(e)),
+            Ok(0) | Err(Errno::INTR) => Ok(Vec::new()),
+            Ok(_) => self.update(pty),
+            Err(e) => {
+                let mut count = self.lock();
+                Err(self.give_up(&mut count, super::sys::failed("waiting for programs")(e)))
+            }
         }
+    }
+
+    /// Handles the opens and closes queued now, without waiting, as
+    /// [`wait`](Self::wait) does.
+    pub(crate) fn update(&self, pty: &Pty) -> io::Result<Vec<Transition>> {
+        let mut count = self.lock();
+        // Read even once the count is lost (`handle` ignores them then): a
+        // queue left full would keep `wait` from ever waiting.
+        let events = self
+            .read_events()
+            .map_err(|e| self.give_up(&mut count, e))?;
         let mut transitions = Vec::new();
-        for event in self.read_events()? {
-            self.handle(event, pty, &mut transitions);
+        for event in events {
+            self.handle(&mut count, event, pty, &mut transitions);
         }
         Ok(transitions)
+    }
+
+    /// After an error the count can no longer be trusted: as after
+    /// [`Transition::Lost`], the device counts as open from then on, so that
+    /// a count stuck at "closed" cannot drop every byte from the bridge.
+    fn give_up(&self, count: &mut Count, e: io::Error) -> io::Error {
+        count.lost = true;
+        self.presence.set(UNKNOWN);
+        e
     }
 
     /// Everything queued, without blocking.
@@ -204,23 +248,24 @@ impl OpenWatch {
     }
 
     fn handle(
-        &mut self,
+        &self,
+        count: &mut Count,
         event: rustix::fs::inotify::ReadFlags,
         pty: &Pty,
         transitions: &mut Vec<Transition>,
     ) {
         use rustix::fs::inotify::ReadFlags;
 
-        if self.lost {
+        if count.lost {
             return;
         }
         if event.contains(ReadFlags::QUEUE_OVERFLOW) {
-            self.lost = true;
+            count.lost = true;
             self.presence.set(UNKNOWN);
             transitions.push(Transition::Lost);
         } else if event.contains(ReadFlags::OPEN) {
-            self.opens += 1;
-            if self.opens == 1 {
+            count.opens += 1;
+            if count.opens == 1 {
                 warn_on_error(pty.flush_input());
                 self.presence.set(OPEN);
                 transitions.push(Transition::Opened);
@@ -228,9 +273,9 @@ impl OpenWatch {
         } else if event.intersects(ReadFlags::CLOSE_WRITE | ReadFlags::CLOSE_NOWRITE) {
             // Saturating: a merged open (see the type's documentation) can
             // leave one close more than opens.
-            let was_open = self.opens > 0;
-            self.opens = self.opens.saturating_sub(1);
-            if was_open && self.opens == 0 {
+            let was_open = count.opens > 0;
+            count.opens = count.opens.saturating_sub(1);
+            if was_open && count.opens == 0 {
                 self.presence.set(CLOSED);
                 warn_on_error(pty.flush_input());
                 warn_on_error(pty.reset_after_close());
@@ -272,20 +317,13 @@ impl OpenWatch {
         match self.never {}
     }
 
-    pub(crate) fn opens(&self) -> u32 {
-        match self.never {}
-    }
-
-    pub(crate) fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        match self.never {}
-    }
-
-    pub(crate) fn wait(
-        &mut self,
-        pty: &Pty,
-        timeout: Option<Duration>,
-    ) -> io::Result<Vec<Transition>> {
+    pub(crate) fn wait(&self, pty: &Pty, timeout: Option<Duration>) -> io::Result<Vec<Transition>> {
         let _ = (pty, timeout);
+        match self.never {}
+    }
+
+    pub(crate) fn update(&self, pty: &Pty) -> io::Result<Vec<Transition>> {
+        let _ = pty;
         match self.never {}
     }
 }
@@ -305,7 +343,7 @@ mod tests {
     }
 
     /// Waits until the watch reports transitions, for at most 5 s.
-    fn next(watch: &mut OpenWatch, pty: &Pty) -> Vec<Transition> {
+    fn next(watch: &OpenWatch, pty: &Pty) -> Vec<Transition> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -319,53 +357,53 @@ mod tests {
 
     /// Handles what is queued (open and close events are queued before the
     /// syscall returns), with no transitions expected.
-    fn quiet(watch: &mut OpenWatch, pty: &Pty) {
+    fn quiet(watch: &OpenWatch, pty: &Pty) {
         assert_eq!(watch.wait(pty, Some(SHORT)).unwrap(), []);
     }
 
     #[test]
     fn counts_opens_by_others_but_not_the_held_slave() {
-        let (pty, mut watch) = watched();
+        let (pty, watch) = watched();
         let presence = watch.presence();
         assert_eq!(presence.get(), Some(false));
         assert!(!presence.is_open());
-        quiet(&mut watch, &pty);
+        quiet(&watch, &pty);
         // Nor does what the bridge does through the held slave.
         pty.set_termios(&pty.termios().unwrap()).unwrap();
         pty.flush_input().unwrap();
         pty.reset_after_close().unwrap();
-        quiet(&mut watch, &pty);
+        quiet(&watch, &pty);
 
         let first = Program::open(&pty);
-        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
         assert_eq!(presence.get(), Some(true));
         let second = Program::open(&pty);
-        quiet(&mut watch, &pty);
+        quiet(&watch, &pty);
         assert_eq!(watch.opens(), 2);
 
         drop(first);
-        quiet(&mut watch, &pty);
+        quiet(&watch, &pty);
         assert_eq!((watch.opens(), presence.get()), (1, Some(true)));
         drop(second);
-        assert_eq!(next(&mut watch, &pty), [Transition::Closed]);
+        assert_eq!(next(&watch, &pty), [Transition::Closed]);
         assert_eq!((watch.opens(), presence.get()), (0, Some(false)));
     }
 
     #[test]
     fn a_read_only_open_counts_too() {
-        let (pty, mut watch) = watched();
+        let (pty, watch) = watched();
         let reader = Program::open_read_only(&pty);
-        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
         drop(reader);
-        assert_eq!(next(&mut watch, &pty), [Transition::Closed]);
+        assert_eq!(next(&watch, &pty), [Transition::Closed]);
     }
 
     #[test]
     fn the_first_open_flushes_stale_input() {
-        let (pty, mut watch) = watched();
+        let (pty, watch) = watched();
         (&pty).write_all(b"stale").unwrap();
         let program = Program::open(&pty);
-        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
         assert_eq!(program.read_for(SHORT), b"");
         (&pty).write_all(b"fresh").unwrap();
         assert_eq!(program.read_exactly(5), b"fresh");
@@ -373,9 +411,9 @@ mod tests {
         // Left unread at the last close: flushed before the next program.
         (&pty).write_all(b"unread").unwrap();
         drop(program);
-        assert_eq!(next(&mut watch, &pty), [Transition::Closed]);
+        assert_eq!(next(&watch, &pty), [Transition::Closed]);
         let next_program = Program::open(&pty);
-        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
         assert_eq!(next_program.read_for(SHORT), b"");
     }
 
@@ -386,9 +424,9 @@ mod tests {
         // forgets it on its last close, which never comes while the bridge
         // holds the slave: after such a program was killed, every open by a
         // normal user failed with EBUSY until the bridge ended.
-        let (pty, mut watch) = watched();
+        let (pty, watch) = watched();
         let killed = Program::open(&pty);
-        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
         killed.set_exclusive();
         match Program::try_open(&pty) {
             Err(e) => assert_eq!(e, rustix::io::Errno::BUSY),
@@ -396,9 +434,9 @@ mod tests {
             Ok(_) => return,
         }
         drop(killed);
-        assert_eq!(next(&mut watch, &pty), [Transition::Closed]);
+        assert_eq!(next(&watch, &pty), [Transition::Closed]);
         let program = Program::try_open(&pty).expect("still in exclusive mode");
-        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
         drop(program);
     }
 
@@ -407,33 +445,78 @@ mod tests {
         // tcflow(TCOOFF) suspends the device's output until a TCOON, which a
         // program killed in between never sends. A real port forgets it on
         // its last close; here every write of the next program failed.
-        let (pty, mut watch) = watched();
+        let (pty, watch) = watched();
         let killed = Program::open(&pty);
-        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
         killed.suspend_output();
         drop(killed);
-        assert_eq!(next(&mut watch, &pty), [Transition::Closed]);
+        assert_eq!(next(&watch, &pty), [Transition::Closed]);
         let program = Program::open(&pty);
-        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
         program.write(b"out");
         assert_eq!(read_master(&pty, 3), b"out");
     }
 
     #[test]
     fn a_quick_open_and_close_are_both_seen() {
-        let (pty, mut watch) = watched();
+        let (pty, watch) = watched();
         drop(Program::open(&pty));
-        let mut seen = next(&mut watch, &pty);
+        let mut seen = next(&watch, &pty);
         if seen == [Transition::Opened] {
-            seen.extend(next(&mut watch, &pty));
+            seen.extend(next(&watch, &pty));
         }
         assert_eq!(seen, [Transition::Opened, Transition::Closed]);
         assert_eq!(watch.presence().get(), Some(false));
     }
 
     #[test]
+    fn an_open_is_queued_before_it_returns() {
+        // What the pty's writer relies on before it drops data: `update`,
+        // which does not wait, already sees the program.
+        let (pty, watch) = watched();
+        let program = Program::open(&pty);
+        assert_eq!(watch.update(&pty).unwrap(), [Transition::Opened]);
+        assert!(watch.presence().is_open());
+        drop(program);
+        assert_eq!(watch.update(&pty).unwrap(), [Transition::Closed]);
+        assert!(!watch.presence().is_open());
+    }
+
+    #[test]
+    fn an_overflow_ends_the_count_and_the_queue_still_drains() {
+        let (pty, watch) = watched();
+        // Each open and close is two events, never merged: past the
+        // kernel's queue limit (fs.inotify.max_queued_events).
+        let limit: usize = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
+            .ok()
+            .and_then(|limit| limit.trim().parse().ok())
+            .unwrap_or(16_384);
+        if limit > 100_000 {
+            eprintln!("skipped: an inotify queue of {limit} events takes too long to fill");
+            return;
+        }
+        for _ in 0..=limit / 2 {
+            drop(Program::open(&pty));
+        }
+        let transitions = watch.update(&pty).unwrap();
+        assert_eq!(
+            transitions.last(),
+            Some(&Transition::Lost),
+            "{transitions:?}"
+        );
+        assert_eq!(watch.presence().get(), None);
+        assert!(watch.presence().is_open());
+        // Later events are still read, or `wait` would never wait again.
+        drop(Program::open(&pty));
+        assert_eq!(watch.update(&pty).unwrap(), []);
+        let start = Instant::now();
+        assert_eq!(watch.wait(&pty, Some(SHORT)).unwrap(), []);
+        assert!(start.elapsed() >= SHORT);
+    }
+
+    #[test]
     fn wait_times_out() {
-        let (pty, mut watch) = watched();
+        let (pty, watch) = watched();
         let start = Instant::now();
         assert_eq!(watch.wait(&pty, Some(SHORT)).unwrap(), []);
         assert!(start.elapsed() >= SHORT);

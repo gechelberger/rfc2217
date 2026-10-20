@@ -205,6 +205,7 @@ impl SettingsWatch {
     }
 
     /// The settings as last seen (or written by [`set_speed`](Self::set_speed)).
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn current(&self) -> PtySettings {
         self.last
     }

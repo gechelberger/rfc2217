@@ -26,7 +26,7 @@ on that too with `--strict`. The library's client is tested against ser2net
 | --- | --- | --- | --- |
 | `connect`, interactive | yes | yes | not yet |
 | `connect`, piped or redirected input | yes | yes | yes |
-| `pty` | yes | yes | no |
+| `pty` | yes | yes, untested so far | no |
 
 ## Install
 
@@ -123,8 +123,8 @@ outcome is settled, and sent only if the session goes on.
 | Exit code | Meaning |
 | --- | --- |
 | 0 | You quit, the input ended (after `--linger`), or the bridge closed the connection (`connect`) |
-| 1 | An I/O error during the session; for `pty`, also the bridge closing the connection |
-| 2 | A usage error, including interactive `connect` and `pty` on Windows |
+| 1 | An I/O error during the session (for `pty`, also the bridge closing the connection), or `pty` could not create the pty or its `--link` |
+| 2 | A usage error, including interactive `connect` on Windows and `pty` on systems other than Linux and macOS |
 | 3 | The host could not be resolved, or did not accept the connection |
 | 4 | Negotiation failed, as in the table above |
 | 128 + N | Stopped by signal N (143 for SIGTERM) |
@@ -199,14 +199,16 @@ type commands.txt | rfc2217 connect bridge.local -b 9600 > reply.txt
 `rfc2217 pty TARGET` (Linux and macOS) creates a pseudo-terminal, connects to
 the bridge and copies the data between the two, until the bridge closes the
 connection (exit code 1) or `rfc2217` is stopped. A program opens the pty as
-if it were a serial port.
+if it were a serial port. The macOS support follows the XNU sources but has not
+run on a Mac yet; Linux is tested.
 
 The pty's own path (`/dev/pts/N` on Linux, `/dev/ttysNNN` on macOS) changes
-from run to run; `rfc2217 pty` reports it when it starts. `--link PATH` also
-makes the pty reachable at a fixed PATH, through a symlink that is removed when
-`rfc2217` exits. Use a path you can write, such as `~/ttyRFC0` or
-`/tmp/ttyRFC0`, never `/dev`: that needs root, and a pty made by root cannot be
-opened by other users. Port lists (IDE port pickers, pyserial's `list_ports`)
+from run to run. `rfc2217 pty` prints it on stdout once the bridge has
+answered, as the only line it ever writes there (`-q` does not hide it), for
+scripts to read. `--link PATH` also makes the pty reachable at a fixed PATH,
+through a symlink that is removed when `rfc2217` exits. Use a path you can
+write, such as `~/ttyRFC0` or `/tmp/ttyRFC0`, never `/dev`: that needs root,
+and a pty made by root cannot be opened by other users. Port lists (IDE port pickers, pyserial's `list_ports`)
 show neither the pty nor the link, so give programs the path. If `rfc2217` is
 killed with SIGKILL, the link stays behind: remove it, because pty numbers are
 reused and a stale link soon points at an unrelated terminal.
@@ -215,8 +217,14 @@ The line settings on the command line are sent when the session starts, as for
 `connect`, and the negotiation is checked the same way. After that,
 `rfc2217` polls the pty's settings about every 50 ms, and when the program
 changes the baud rate, the stop bits (1 or 2) or the flow control (RTS/CTS or
-XON/XOFF), the new settings go to the bridge. `--dtr` and `--rts` set the
-remote lines once connected.
+XON/XOFF), the new settings go to the bridge. With `--baud keep`, the default,
+the pty shows the bridge's baud rate. `--dtr` and `--rts` set the remote lines
+once connected.
+
+On Linux, the port's data is dropped while no program has the pty open, so a
+program reads only what arrived after it opened the device, as with a real
+port. macOS cannot tell when the pty is opened: there, data that arrives while
+no program has it open waits for the next one.
 
 ### What a pty cannot carry
 
