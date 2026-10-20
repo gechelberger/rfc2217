@@ -15,7 +15,7 @@ default:
 # Format check, clippy and tests for both crates.
 check: lint test cli-lint cli-test
 
-# Everything CI checks, for both crates. Needs the 1.85 and nightly toolchains and the targets of `cli-cross`.
+# Everything CI checks, for both crates. Needs the 1.85 and nightly toolchains.
 ci: lint docs docs-rs test msrv no-std minimal-versions package cli-lint cli-cross cli-test cli-msrv cli-package
 
 # Format both crates and the firmware stub.
@@ -106,9 +106,10 @@ cli-lint:
     cargo clippy --all-targets --locked {{ cli_manifest }} -- -D warnings
     cargo fmt --check {{ cli_manifest }}
 
-# Clippy as the Windows and macOS runners see the code. Needs `rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin`.
+# Clippy as the Windows and macOS runners see the code.
 [group('cli')]
 cli-cross:
+    rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin
     cargo clippy --all-targets --locked {{ cli_manifest }} --target x86_64-pc-windows-gnu -- -D warnings
     cargo clippy --all-targets --locked {{ cli_manifest }} --target x86_64-apple-darwin -- -D warnings
 
