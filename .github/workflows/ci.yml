@@ -6,6 +6,8 @@ name: CI
 on:
   push:
   pull_request:
+  # release.yml runs every job here on the tagged commit before publishing.
+  workflow_call:
 
 permissions:
   contents: read
@@ -22,7 +24,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
       - run: cargo test
       - run: cargo test --all-features
@@ -31,7 +35,9 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install 1.85 --profile minimal --no-self-update
       # Edition 2024 implies resolver 3, which picks dependency versions whose
       # rust-version is at most 1.85. If a newer cargo rewrote Cargo.lock in a
@@ -43,7 +49,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update && rustup default stable
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -57,7 +65,9 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
       - run: cargo doc --no-deps --all-features
       - run: cargo doc --no-deps --no-default-features
@@ -69,14 +79,18 @@ jobs:
     env:
       RUSTDOCFLAGS: --cfg docsrs
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install nightly --profile minimal --no-self-update
       - run: cargo +nightly doc --no-deps --all-features
 
   no_std:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
       - run: rustup target add thumbv6m-none-eabi
       - run: cargo build --lib --target thumbv6m-none-eabi --no-default-features
@@ -89,7 +103,9 @@ jobs:
   minimal-versions:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install nightly 1.85 --profile minimal --no-self-update
       # Rewrites Cargo.lock with the lowest versions Cargo.toml allows for the
       # direct dependencies (tracing 0.1.40); the checkout is thrown away after.
@@ -99,7 +115,9 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
       - run: cargo publish --dry-run
       - name: package excludes CI files and build output

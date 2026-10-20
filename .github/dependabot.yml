@@ -1,0 +1,11 @@
+# Weekly pull requests that move the SHA-pinned actions (and the version
+# comments next to them) in .github/workflows to new releases.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Leave a new release alone for a week before proposing it.
+    cooldown:
+      default-days: 7

@@ -1,0 +1,231 @@
+# Release: pushing a vX.Y.Z tag publishes rfc2217 to crates.io and creates the
+# GitHub release.
+#
+#   verify          tag == "v" + the Cargo.toml version, the tagged commit is on
+#                   main, Cargo.lock is current, CHANGELOG.md has a dated
+#                   section for the version (its body becomes the notes), and
+#                   `cargo publish --dry-run` builds the package
+#   ci              every ci.yml job, on the tagged commit
+#   publish         crates.io trusted publishing (a short-lived OIDC-based
+#                   token; no API token secret), in the `release` environment.
+#                   It builds nothing: see the comment on the job.
+#   github-release  creates the GitHub release, or updates it on a re-run
+#
+# crates.io trusts this file by its name (release.yml) and the `release`
+# environment. Renaming either breaks publishing until the crates.io trusted
+# publisher (crate Settings > Trusted Publishing) is changed to match.
+#
+# Re-runs are safe: a version already on crates.io from this commit is not
+# published again, and an existing release is updated instead of duplicated.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # Explicit bash runs steps with `-eo pipefail`.
+    shell: bash
+
+jobs:
+  verify:
+    name: Check tag, version and changelog
+    # A fork that enables Actions and pushes a v* tag skips the whole run.
+    if: github.repository == 'gechelberger/rfc2217'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # actions/checkout
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # All branches and tags, to check that the tag is on main.
+          fetch-depth: 0
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Tag matches Cargo.toml and is on main
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # --locked (with dependency resolution) also fails when a version
+          # bump was committed without the matching Cargo.lock change.
+          version=$(cargo metadata --format-version 1 --locked |
+            jq -r '.packages[] | select(.name == "rfc2217" and .source == null) | .version')
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::unexpected Cargo.toml version '$version'"
+            exit 1
+          fi
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match the Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+          head=$(git rev-parse HEAD)
+          if [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$head" ]; then
+            echo "::error::the checkout is not the commit tagged $TAG (was the tag moved?)"
+            exit 1
+          fi
+          # Releases come from main only. Releasing from a maintenance branch
+          # would need this check widened to that (protected) branch, and
+          # `--latest=false` on its GitHub release.
+          if ! git merge-base --is-ancestor "$head" refs/remotes/origin/main; then
+            echo "::error::$TAG ($head) is not on main"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Release notes from CHANGELOG.md
+        id: notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash .github/scripts/release-notes.sh "$VERSION" CHANGELOG.md HEAD > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          # One line of base64: no heredoc delimiter can collide with the notes.
+          echo "notes=$(base64 -w0 "$RUNNER_TEMP/notes.md")" >> "$GITHUB_OUTPUT"
+      # The publish build happens here, in a job that cannot get an OIDC token,
+      # because build scripts and proc-macros run during it (see `publish`).
+      # A version already on crates.io only warns, so re-runs still pass.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --locked
+
+  ci:
+    name: CI
+    needs: verify
+    # The same checks as pushes and pull requests. A same-repository reusable
+    # workflow runs from the caller's commit, so this tests the tagged commit.
+    # zizmor's self-repository audit prefers `$/`; `./` resolves to the same
+    # commit for a reusable workflow, and actionlint does not accept `$/` yet.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read # actions/checkout in every ci.yml job
+
+  publish:
+    name: Publish to crates.io
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # crates.io checks the OIDC token's repository, workflow file (release.yml)
+    # and environment (release), but not the ref. So the `release` environment
+    # is what stops any other run of this file from publishing:
+    # - its required reviewer, which GitHub enforces for every job that names
+    #   the environment, `deployment: false` included;
+    # - its tag policy (v* only), which adds a second gate.
+    # Approve only runs whose ref is the vX.Y.Z tag being released.
+    environment:
+      name: release
+      url: https://crates.io/crates/rfc2217/${{ needs.verify.outputs.version }}
+    # One publish at a time; never cancel one that has started.
+    concurrency:
+      group: crates-io-publish
+      cancel-in-progress: false
+    # id-token: write applies to the whole job, not to one step. Every step,
+    # and every process a step starts, gets ACTIONS_ID_TOKEN_REQUEST_URL and
+    # ACTIONS_ID_TOKEN_REQUEST_TOKEN, so it can fetch an OIDC token and trade
+    # it for a crates.io token of its own. So nothing in this job compiles:
+    # no build script or proc-macro ever runs here. The build is done by
+    # `verify` (cargo publish --dry-run) and by CI.
+    permissions:
+      contents: read # actions/checkout
+      id-token: write # the OIDC token that crates-io-auth-action exchanges
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      # A re-run after a later job failed must not publish again. A version
+      # that is on crates.io from another commit stops the release instead.
+      - name: Is this version already on crates.io?
+        id: crates-io
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          ua='rfc2217 release workflow (https://github.com/gechelberger/rfc2217)'
+          status=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' -A "$ua" \
+            "https://crates.io/api/v1/crates/rfc2217/$VERSION")
+          case $status in
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            200)
+              crate="rfc2217-$VERSION"
+              curl -fsSL --retry 3 -A "$ua" -o "$RUNNER_TEMP/$crate.crate" \
+                "https://static.crates.io/crates/rfc2217/$crate.crate"
+              if ! vcs=$(tar -xzOf "$RUNNER_TEMP/$crate.crate" "$crate/.cargo_vcs_info.json"); then
+                echo "::error::rfc2217 $VERSION is on crates.io without .cargo_vcs_info.json; cannot tell which commit it came from"
+                exit 1
+              fi
+              published=$(jq -r '.git.sha1 // empty' <<< "$vcs")
+              head=$(git rev-parse HEAD)
+              if [ "$published" != "$head" ]; then
+                echo "::error::rfc2217 $VERSION is already on crates.io from commit ${published:-unknown}, but $GITHUB_REF_NAME is $head"
+                exit 1
+              fi
+              if [ "$(jq -r '.git.dirty // false' <<< "$vcs")" = true ]; then
+                echo "::warning::rfc2217 $VERSION was published from $head with uncommitted changes"
+              fi
+              echo "rfc2217 $VERSION is already on crates.io from $head: skipping the publish"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io answered HTTP $status for rfc2217 $VERSION"
+              exit 1
+              ;;
+          esac
+      # Exchanges the job's OIDC token for a crates.io token that expires after
+      # 30 minutes; the action's post step revokes it when the job ends.
+      - name: crates.io token (trusted publishing)
+        id: auth
+        if: steps.crates-io.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: cargo publish
+        if: steps.crates-io.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        # --no-verify packages the crate and uploads it without building it,
+        # so no build script or proc-macro runs in this job. `verify` built
+        # the same commit with `cargo publish --dry-run --locked`.
+        run: cargo publish --locked --no-verify
+
+  github-release:
+    name: GitHub release
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # gh release create / edit
+    steps:
+      # No checkout and no third-party code in the only job that can write.
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          NOTES: ${{ needs.verify.outputs.notes }}
+        run: |
+          printf '%s' "$NOTES" | base64 -d > "$RUNNER_TEMP/notes.md"
+          title="rfc2217 $VERSION"
+          prerelease=false
+          if [[ $VERSION == *-* ]]; then prerelease=true; fi
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # A re-run, or a release made by hand: bring title and notes in line.
+            # `release view` also finds a draft for the tag; --draft=false
+            # publishes it (edit leaves the draft flag alone otherwise).
+            gh release edit "$TAG" --title "$title" --notes-file "$RUNNER_TEMP/notes.md" \
+              --prerelease="$prerelease" --draft=false
+          else
+            # --verify-tag: release the pushed tag; never create one.
+            gh release create "$TAG" --verify-tag --title "$title" \
+              --notes-file "$RUNNER_TEMP/notes.md" --prerelease="$prerelease"
+          fi
