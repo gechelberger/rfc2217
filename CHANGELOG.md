@@ -8,7 +8,7 @@ Changes to wire behaviour and to the fixed capacities are always listed.
 
 ## [Unreleased]
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-20
 
 The first release.
 
