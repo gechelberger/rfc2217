@@ -1,5 +1,6 @@
 # Weekly pull requests that move the SHA-pinned actions (and the version
-# comments next to them) in .github/workflows to new releases.
+# comments next to them) in .github/workflows to new releases, and the
+# command-line crate's locked dependencies to new compatible versions.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -9,3 +10,20 @@ updates:
     # Leave a new release alone for a week before proposing it.
     cooldown:
       default-days: 7
+
+  # rfc2217-cli ships its Cargo.lock (users install with --locked), so its
+  # dependencies only move when that lockfile does. lockfile-only never edits
+  # the requirements in rfc2217-cli/Cargo.toml: a new major version (clap 5,
+  # say) stays a manual change. One grouped pull request a week, which
+  # ci-cli.yml tests on the three OSes and on the MSRV. The library (rfc2217,
+  # a path dependency here) is not updated by this entry.
+  - package-ecosystem: "cargo"
+    directory: "/rfc2217-cli"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    versioning-strategy: lockfile-only
+    groups:
+      rfc2217-cli:
+        patterns: ["*"]

@@ -10,14 +10,18 @@
 #   - the date is later than today (UTC) + 1 day, or earlier than the commit
 #     date of COMMIT (UTC) - 1 day (a date left over from an earlier draft),
 #   - the section body is empty,
-#   - the "[VERSION]: <url ending in vVERSION>" link reference is missing.
+#   - the "[VERSION]: <url>" link reference is missing, or its URL does not
+#     end in "/TAG" (a releases/tag URL) or ".TAG" (a compare/a...b URL).
+#     Requiring the separator keeps a changelog that links the other crate's
+#     tags from passing: "rfc2217-cli-v0.1.0" ends in "v0.1.0" too.
 #
-# Usage: bash .github/scripts/release-notes.sh VERSION [CHANGELOG] [COMMIT]
-#   CHANGELOG defaults to CHANGELOG.md, COMMIT to HEAD.
-# release.yml runs it before publishing; run it locally before tagging to see
-# the notes the GitHub release will get.
-# Matching is literal (no regex built from VERSION), so "1.2.3" never matches
-# "1x2y3" and pre-release versions such as "1.0.0-rc.1" work unchanged.
+# Usage: bash .github/scripts/release-notes.sh VERSION [CHANGELOG] [COMMIT] [TAG]
+#   CHANGELOG defaults to CHANGELOG.md, COMMIT to HEAD, TAG to vVERSION (the
+#   library's tags; release-cli.yml passes rfc2217-cli-vVERSION).
+# release.yml and release-cli.yml run it before publishing; run it locally
+# before tagging to see the notes the GitHub release will get.
+# Matching is literal (no regex built from VERSION or TAG), so "1.2.3" never
+# matches "1x2y3" and pre-release versions such as "1.0.0-rc.1" work unchanged.
 set -euo pipefail
 
 fail() {
@@ -25,10 +29,11 @@ fail() {
     exit 1
 }
 
-[ $# -ge 1 ] && [ $# -le 3 ] || fail "usage: $0 VERSION [CHANGELOG] [COMMIT]"
+[ $# -ge 1 ] && [ $# -le 4 ] || fail "usage: $0 VERSION [CHANGELOG] [COMMIT] [TAG]"
 version=$1
 changelog=${2:-CHANGELOG.md}
 commit=${3:-HEAD}
+tag=${4:-v$version}
 [ -f "$changelog" ] || fail "$changelog not found"
 
 prefix="## [$version]"
@@ -57,11 +62,16 @@ commit_s=$(date -u -d "$commit_day" +%s)
 [ "$release_s" -ge $((commit_s - day)) ] ||
     fail "'$headings' is dated before the tagged commit ($commit_day UTC): update the date"
 
-# The link reference, e.g. "[0.2.0]: https://github.com/o/r/compare/v0.1.0...v0.2.0".
-awk -v p="[$version]: " -v t="v$version" '
-    substr($0, 1, length(p)) == p && substr($0, length($0) - length(t) + 1) == t { found = 1 }
+# The link reference, e.g. "[0.2.0]: https://github.com/o/r/compare/v0.1.0...v0.2.0":
+# the URL is non-empty and ends in TAG, right after a "/" or a ".".
+awk -v p="[$version]: " -v t="$tag" '
+    substr($0, 1, length(p)) == p && length($0) > length(p) + length(t) &&
+        substr($0, length($0) - length(t) + 1) == t {
+        sep = substr($0, length($0) - length(t), 1)
+        if (sep == "/" || sep == ".") found = 1
+    }
     END { exit !found }' "$changelog" ||
-    fail "missing link reference '[$version]: <url ending in v$version>' in $changelog"
+    fail "missing link reference '[$version]: <url ending in /$tag or .$tag>' in $changelog"
 
 # The body: after the heading, up to the next "## " heading. Link reference
 # definitions inside the section stay, with whatever follows them. If the
