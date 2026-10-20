@@ -1,10 +1,14 @@
-# Development tasks for both crates: the library (this directory, checked by
-# .github/workflows/ci.yml) and the command-line crate in rfc2217-cli/
-# (ci-cli.yml). The CLI is a workspace of its own, so `cargo -p` cannot reach
-# it from here; its recipes pass its manifest instead.
+# Development tasks for both crates: the library (this directory) and the
+# command-line crate in rfc2217-cli/. The CLI is a workspace of its own, so
+# `cargo -p` cannot reach it from here; its recipes pass its manifest instead.
 #
-# The recipes run what CI runs; the workflows remain the reference. `just`
-# lists them, `just check` is the quick loop, `just ci` runs everything.
+# CI runs these recipes: each check job in .github/workflows/ci.yml (the
+# library) and ci-cli.yml (the CLI) is one `just <recipe>`, so a recipe here
+# is what CI checks. The workflows add what only CI needs: the toolchains,
+# `just` itself, the OS matrix, and the package jobs, which stay in YAML.
+#
+# `just` lists the recipes, `just check` is the quick loop, `just ci` runs
+# them all.
 
 cli_manifest := "--manifest-path rfc2217-cli/Cargo.toml"
 
@@ -15,7 +19,7 @@ default:
 # Format check, clippy and tests for both crates.
 check: lint test cli-lint cli-test
 
-# Everything CI checks, for both crates. Needs the 1.85 and nightly toolchains.
+# Everything CI checks, for both crates (with cross-target clippy for the Windows and macOS runners). Needs the 1.85 and nightly toolchains.
 ci: lint docs docs-rs test msrv no-std minimal-versions package cli-lint cli-cross cli-test cli-msrv cli-package
 
 # Format both crates and the firmware stub.
@@ -47,11 +51,11 @@ lint:
     cargo fmt --check
     cargo fmt --check --manifest-path ci/fw-stub/Cargo.toml
 
-# The API docs, with all and no features.
+# The API docs, with all and no features; a rustdoc warning fails.
 [group('library')]
 docs:
-    cargo doc --no-deps --all-features
-    cargo doc --no-deps --no-default-features
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
 
 # The API docs as docs.rs builds them.
 [group('library')]
@@ -102,9 +106,13 @@ cli-msrv:
 
 # Clippy and the format check for the CLI.
 [group('cli')]
-cli-lint:
-    cargo clippy --all-targets --locked {{ cli_manifest }} -- -D warnings
+cli-lint: cli-clippy
     cargo fmt --check {{ cli_manifest }}
+
+# Clippy for the CLI, on this platform.
+[group('cli')]
+cli-clippy:
+    cargo clippy --all-targets --locked {{ cli_manifest }} -- -D warnings
 
 # Clippy as the Windows and macOS runners see the code.
 [group('cli')]
