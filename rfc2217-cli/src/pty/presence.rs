@@ -13,7 +13,11 @@
 //! stale) instead of writing it to the master. [`OpenWatch::wait`] flushes
 //! the slave's input queue itself, on each first open and on each last
 //! close, in the order that keeps the bridge's later writes out of the
-//! flush.
+//! flush. On each last close it also undoes the exclusive mode and the
+//! suspended output a program may have left ([`Pty::reset_after_close`]).
+//! On macOS both presumably survive as well (XNU clears them only on the
+//! last close of the replica, from its source, untested), and with nothing
+//! to say when the last program has gone they stay until the bridge ends.
 
 use std::io;
 use std::sync::Arc;
@@ -70,7 +74,8 @@ pub(crate) enum Transition {
     /// The first program opened the device; the input queue was flushed
     /// before the presence turned open.
     Opened,
-    /// The last program closed it; what it left unread was flushed.
+    /// The last program closed it; what it left unread was flushed, and its
+    /// exclusive mode and suspended output were undone.
     Closed,
     /// The kernel's event queue overflowed and opens or closes were lost:
     /// from now on the device counts as open ([`Presence::get`] is `None`).
@@ -82,8 +87,9 @@ pub(crate) enum Transition {
 /// The count has one blind spot: inotify merges an event into the previous
 /// one when both are identical and still unread, so two opens within the
 /// same instant (before this thread reads the first) count as one. The
-/// count can then reach zero while one of them still has the device open,
-/// and data is dropped until the next open. Two closes merged the same way
+/// count can then reach zero while one of them still has the device open:
+/// data is dropped until the next open, and that program's exclusive mode or
+/// suspended output is undone. Two closes merged the same way
 /// leave the device counted as open, the same as no detection at all.
 ///
 /// Events arrive after the fact, so the flushes are not exact either. A
@@ -147,7 +153,9 @@ impl OpenWatch {
     ///
     /// On a first open, the input queue is flushed before the presence turns
     /// open; on the last close, the presence turns closed first. So nothing
-    /// the bridge writes after seeing the device open is flushed.
+    /// the bridge writes after seeing the device open is flushed. The last
+    /// close also calls [`Pty::reset_after_close`]. A failed flush or reset
+    /// is a warning (`ui::warn`), not an error.
     pub(crate) fn wait(
         &mut self,
         pty: &Pty,
@@ -213,7 +221,7 @@ impl OpenWatch {
         } else if event.contains(ReadFlags::OPEN) {
             self.opens += 1;
             if self.opens == 1 {
-                flush(pty);
+                warn_on_error(pty.flush_input());
                 self.presence.set(OPEN);
                 transitions.push(Transition::Opened);
             }
@@ -224,7 +232,8 @@ impl OpenWatch {
             self.opens = self.opens.saturating_sub(1);
             if was_open && self.opens == 0 {
                 self.presence.set(CLOSED);
-                flush(pty);
+                warn_on_error(pty.flush_input());
+                warn_on_error(pty.reset_after_close());
                 transitions.push(Transition::Closed);
             }
         }
@@ -233,11 +242,12 @@ impl OpenWatch {
     }
 }
 
-/// A failed flush costs at most some stale bytes for the next program; the
-/// count must go on regardless, so it is a warning, not an error.
+/// A failed flush or reset costs the next program some stale bytes or a
+/// device it cannot use; the count must go on regardless, so it is a
+/// warning, not an error.
 #[cfg(target_os = "linux")]
-fn flush(pty: &Pty) {
-    if let Err(e) = pty.flush_input() {
+fn warn_on_error(result: io::Result<()>) {
+    if let Err(e) = result {
         crate::ui::warn(e);
     }
 }
@@ -286,7 +296,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::pty::testing::{Program, SHORT, settings};
+    use crate::pty::testing::{Program, SHORT, read_master, settings};
 
     fn watched() -> (Pty, OpenWatch) {
         let pty = Pty::open(&settings(9600)).unwrap();
@@ -319,6 +329,11 @@ mod tests {
         let presence = watch.presence();
         assert_eq!(presence.get(), Some(false));
         assert!(!presence.is_open());
+        quiet(&mut watch, &pty);
+        // Nor does what the bridge does through the held slave.
+        pty.set_termios(&pty.termios().unwrap()).unwrap();
+        pty.flush_input().unwrap();
+        pty.reset_after_close().unwrap();
         quiet(&mut watch, &pty);
 
         let first = Program::open(&pty);
@@ -362,6 +377,46 @@ mod tests {
         let next_program = Program::open(&pty);
         assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
         assert_eq!(next_program.read_for(SHORT), b"");
+    }
+
+    #[test]
+    fn the_last_close_ends_exclusive_mode() {
+        // serialport-rs sets TIOCEXCL on every open by default and clears it
+        // only when it closes the port itself. A real port
+        // forgets it on its last close, which never comes while the bridge
+        // holds the slave: after such a program was killed, every open by a
+        // normal user failed with EBUSY until the bridge ended.
+        let (pty, mut watch) = watched();
+        let killed = Program::open(&pty);
+        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        killed.set_exclusive();
+        match Program::try_open(&pty) {
+            Err(e) => assert_eq!(e, rustix::io::Errno::BUSY),
+            // CAP_SYS_ADMIN opens an exclusive tty anyway: nothing to test.
+            Ok(_) => return,
+        }
+        drop(killed);
+        assert_eq!(next(&mut watch, &pty), [Transition::Closed]);
+        let program = Program::try_open(&pty).expect("still in exclusive mode");
+        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        drop(program);
+    }
+
+    #[test]
+    fn the_last_close_restarts_suspended_output() {
+        // tcflow(TCOOFF) suspends the device's output until a TCOON, which a
+        // program killed in between never sends. A real port forgets it on
+        // its last close; here every write of the next program failed.
+        let (pty, mut watch) = watched();
+        let killed = Program::open(&pty);
+        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        killed.suspend_output();
+        drop(killed);
+        assert_eq!(next(&mut watch, &pty), [Transition::Closed]);
+        let program = Program::open(&pty);
+        assert_eq!(next(&mut watch, &pty), [Transition::Opened]);
+        program.write(b"out");
+        assert_eq!(read_master(&pty, 3), b"out");
     }
 
     #[test]

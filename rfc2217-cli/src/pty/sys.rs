@@ -137,6 +137,26 @@ impl Pty {
             .map_err(failed(format_args!("flushing {}", self.path.display())))
     }
 
+    /// Undoes what a program can leave set that a real port forgets on its
+    /// last close, which never comes while the slave is held: exclusive mode
+    /// (`TIOCEXCL`; serialport-rs sets it on every open by default and clears
+    /// it only when it closes the port itself, so after such a program was
+    /// killed every open by a normal user would fail with EBUSY), and
+    /// output suspended with `tcflow(TCOOFF)`, which would make every write
+    /// of the next program block or fail. Called when the last program has
+    /// closed the device (Linux only: elsewhere nothing tells when that is).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reset_after_close(&self) -> io::Result<()> {
+        termios::ioctl_tiocnxcl(&self.slave).map_err(failed(format_args!(
+            "ending exclusive mode on {}",
+            self.path.display()
+        )))?;
+        termios::tcflow(&self.slave, termios::Action::OOn).map_err(failed(format_args!(
+            "restarting the output of {}",
+            self.path.display()
+        )))
+    }
+
     /// The termios the local program sees.
     pub(super) fn termios(&self) -> io::Result<Termios> {
         termios::tcgetattr(&self.slave).map_err(failed(format_args!(
@@ -183,12 +203,11 @@ pub(super) fn failed(what: impl fmt::Display) -> impl FnOnce(rustix::io::Errno) 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::io::{Read, Write};
-    use std::time::Duration;
 
     use rustix::termios::{ControlModes, InputModes, LocalModes, OutputModes};
 
     use super::*;
-    use crate::pty::testing::{Program, SHORT, readable, settings};
+    use crate::pty::testing::{Program, SHORT, read_master, readable, settings};
 
     #[test]
     fn opens_a_device_the_user_can_use() {
@@ -288,20 +307,6 @@ mod tests {
         assert_eq!(program.read_for(SHORT), b"");
         (&pty).write_all(b"fresh").unwrap();
         assert_eq!(program.read_exactly(5), b"fresh");
-    }
-
-    fn read_master(pty: &Pty, len: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut buf = [0; 64];
-        while out.len() < len {
-            assert!(
-                readable(pty.master(), Duration::from_secs(5)),
-                "timed out after {out:?}"
-            );
-            let n = (&*pty).read(&mut buf).unwrap();
-            out.extend_from_slice(&buf[..n]);
-        }
-        out
     }
 
     fn read_error(pty: &Pty) -> io::ErrorKind {

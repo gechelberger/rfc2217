@@ -5,6 +5,7 @@
 // these helpers have no user.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -38,6 +39,19 @@ pub(super) fn readable(fd: BorrowedFd<'_>, timeout: Duration) -> bool {
     rustix::event::poll(&mut fds, Some(&timeout)).unwrap() > 0
 }
 
+/// Reads `len` bytes from the master, waiting at most [`DEADLINE`] for each
+/// chunk.
+pub(super) fn read_master(pty: &Pty, len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0; 64];
+    while out.len() < len {
+        assert!(readable(pty.master(), DEADLINE), "timed out after {out:?}");
+        let n = (&*pty).read(&mut buf).unwrap();
+        out.extend_from_slice(&buf[..n]);
+    }
+    out
+}
+
 /// A local program: the device opened by its path, non-blocking.
 #[derive(Debug)]
 pub(super) struct Program(OwnedFd);
@@ -51,9 +65,28 @@ impl Program {
         Self::open_with(pty.path(), OFlags::RDONLY)
     }
 
+    /// [`open`](Self::open), returning the error instead of panicking.
+    pub(super) fn try_open(pty: &Pty) -> rustix::io::Result<Self> {
+        Self::try_open_with(pty.path(), OFlags::RDWR)
+    }
+
     fn open_with(path: &Path, access: OFlags) -> Self {
+        Self::try_open_with(path, access).unwrap()
+    }
+
+    fn try_open_with(path: &Path, access: OFlags) -> rustix::io::Result<Self> {
         let flags = access | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        Self(rustix::fs::open(path, flags, Mode::empty()).unwrap())
+        rustix::fs::open(path, flags, Mode::empty()).map(Self)
+    }
+
+    /// Exclusive mode (`TIOCEXCL`), as serialport-rs sets it on every open.
+    pub(super) fn set_exclusive(&self) {
+        termios::ioctl_tiocexcl(&self.0).unwrap();
+    }
+
+    /// Suspends the device's output (`tcflow(TCOOFF)`).
+    pub(super) fn suspend_output(&self) {
+        termios::tcflow(&self.0, termios::Action::OOff).unwrap();
     }
 
     pub(super) fn termios(&self) -> Termios {
