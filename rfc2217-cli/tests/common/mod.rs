@@ -60,7 +60,7 @@ pub(crate) struct Options {
     /// Close the connection once the data received contains this.
     pub(crate) close_on: Option<Vec<u8>>,
     /// Socket buffers of a few KiB, so that a transfer outgrows them many
-    /// times over (review finding vc-1).
+    /// times over.
     pub(crate) small_buffers: bool,
     /// Send FLOWCONTROL-SUSPEND as COM-PORT-OPTION goes active, and
     /// FLOWCONTROL-RESUME this much later.
@@ -332,7 +332,7 @@ pub(crate) enum Script {
     /// A raw TCP port in front of a device that never says anything.
     Silent,
     /// A raw TCP port in front of a device that echoes: the client's own
-    /// requests come back (review finding vc-2).
+    /// requests come back.
     Echo,
     /// A bridge on a port that takes nothing but 8N1, as sredird on a pty:
     /// it answers every setting, data bits with 8 and parity with none, and

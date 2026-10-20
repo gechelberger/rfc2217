@@ -2,13 +2,13 @@
 //!
 //! Raw mode hands every key to the port as typed: no line editing, no echo,
 //! and no signals, so Ctrl-C and Ctrl-Z reach the device as 0x03 and 0x1A
-//! (review finding cn-2) and the escape key is the only way out from the
-//! keyboard. Output processing is off too, which is why [`ui::set_raw`]
-//! switches the CLI's own messages to CR LF while raw mode is on.
+//! and the escape key is the only way out from the keyboard. Output
+//! processing is off too, which is why [`ui::set_raw`] switches the CLI's own
+//! messages to CR LF while raw mode is on.
 //!
 //! Only stdin's terminal is touched, and only when stdin is one: a pipe on
 //! stdin must not put the controlling terminal into raw mode behind the
-//! user's back (finding cn-4).
+//! user's back.
 //!
 //! A stop from outside (`kill -STOP`, or SIGTSTP from another process) lets
 //! the shell put its own settings back; on SIGCONT raw mode is set again.

@@ -4,7 +4,7 @@
 //!
 //! [`std::process::exit`] runs no destructors, on any thread, and a worker
 //! that panics never reaches the owner's: so the actions live in a registry
-//! rather than in `Drop` impls alone (critic finding cc-8), and each runs
+//! rather than in `Drop` impls alone, and each runs
 //! exactly once, from whichever of these paths gets there first:
 //!
 //! - `main` returning, with any [`Exit`](crate::Exit): it calls [`run_all`].
@@ -14,9 +14,9 @@
 //!   If no session listens, or it has not finished within [`GRACE`], the
 //!   signal thread runs the registry and exits itself.
 //! - A panic on any thread: the hook runs the registry, prints the panic and
-//!   exits 101. A session must never carry on after one of its threads died
-//!   (review finding cn-4), and with the terminal restored under it, it
-//!   would carry on with local echo and Ctrl-C killing it.
+//!   exits 101. A session must never carry on after one of its threads
+//!   died: with the terminal restored under it, it would carry on with local
+//!   echo and Ctrl-C killing it.
 //!
 //! A signal that was ignored when the process started stays ignored, as
 //! `nohup` and a shell's background jobs expect: SIGHUP, SIGINT and SIGQUIT

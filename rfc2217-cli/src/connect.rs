@@ -7,7 +7,7 @@
 //! included: the library escapes IAC). At the end of piped input it keeps
 //! copying the port's output until that has been quiet for `--linger`,
 //! instead of closing at once: bridges close the connection when they read
-//! its end, and the device's reply would be lost (finding cn-7).
+//! its end, and the device's reply would be lost.
 
 use std::io::{self, IsTerminal};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use crate::ui;
 pub(crate) fn run(args: ConnectArgs) -> Exit {
     let interactive = io::stdin().is_terminal();
     // Windows consoles strip Ctrl-Z from reads and reject output that is
-    // not UTF-8 (finding cn-6): a terminal session, and the port's output
+    // not UTF-8: a terminal session, and the port's output
     // on a console, need console code of their own there.
     #[cfg(not(unix))]
     {
@@ -107,7 +107,7 @@ mod terminal {
     use crate::ui;
 
     /// How long `b` holds the BREAK. RFC 2217 has no duration: the CLI
-    /// times the BREAK-OFF itself (finding cn-9).
+    /// times the BREAK-OFF itself.
     const BREAK: Duration = Duration::from_millis(250);
 
     /// How long `z` waits for what was typed before it to be written.
@@ -380,7 +380,7 @@ mod terminal {
     /// takes up RFC 2217, ahead of it; and it would hold a BREAK-ON and the
     /// BREAK-OFF timed here, and send them back to back: a BREAK of no
     /// length), and not while the bridge refuses RFC 2217 (the alloc layer
-    /// would drop the command silently, finding cn-9).
+    /// would drop the command silently).
     fn usable(ctl: &mut Ctl, what: &str) -> bool {
         if !ctl.settled() {
             ui::notice(format_args!(

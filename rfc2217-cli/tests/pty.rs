@@ -4,8 +4,7 @@
 //!
 //! The termios calls go through rustix, which makes the ioctls itself: with
 //! Debian's and Ubuntu's glibc, `tcsetattr` on a pty fails with EINVAL for
-//! some requests (critic finding cc-2), and the tests must not depend on the
-//! C library.
+//! some requests, and the tests must not depend on the C library.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 

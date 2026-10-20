@@ -11,19 +11,19 @@
 //! The owner never blocks on a write. The library's driving contract (its
 //! README, "Driving model") is that a loop which writes everything before it
 //! reads again deadlocks against a peer that does the same, and a quit key
-//! or a signal must not wait on the peer either (review finding cn-3). So
-//! the owner hands each chunk to a writer thread, and memory is bounded by
-//! pausing the reader that feeds a full direction, never the owner (finding
-//! vc-1): the socket reader waits while more than [`LIMIT`] bytes are on
-//! their way to the local writer, and the local reader waits while more than
-//! [`LIMIT`] bytes are on their way to the socket (input not yet handed to
-//! the client included). The readers wait on a condvar and the owner on its
+//! or a signal must not wait on the peer either. So the owner hands each
+//! chunk to a writer thread, and memory is bounded by pausing the reader
+//! that feeds a full direction, never the owner (which would bring the
+//! deadlock back): the socket reader waits while more than [`LIMIT`] bytes
+//! are on their way to the local writer, and the local reader waits while
+//! more than [`LIMIT`] bytes are on their way to the socket (input not yet
+//! handed to the client included). The readers wait on a condvar and the owner on its
 //! channel, with its next deadline as the timeout: nothing polls.
 //!
 //! The owner also applies the readiness policy. Remote output is shown at
 //! once, also while negotiating; local input is held until the negotiation
 //! has settled, and while the bridge has suspended the data flow (the
-//! library's flow control is advisory: the CLI enforces it, finding cn-12).
+//! library's flow control is advisory: the CLI enforces it).
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -123,9 +123,9 @@ pub(crate) enum InputEnd {
     Exit(Exit),
 }
 
-/// The local end of a session: `connect`'s terminal or pipe, and in the
-/// next stage the pty master. The engine calls these on the owner thread,
-/// so they must not block; the client's output is written after each call.
+/// The local end of a session: `connect`'s terminal or pipe, or `pty`'s
+/// master. The engine calls these on the owner thread, so they must not
+/// block; the client's output is written after each call.
 /// The defaults are those of a byte-transparent end.
 ///
 /// How `pty` plugs in: its [`LocalIo`] reads and writes the pty master
@@ -673,7 +673,8 @@ struct Engine<'a, L> {
     /// The deadline was put off once already, after it was found long past
     /// ([`LATE`]).
     regraced: bool,
-    /// The peer echoed one of our requests back (review finding vc-2).
+    /// The peer echoed one of our requests back: a raw TCP port in front of
+    /// a device that echoes, not RFC 2217.
     echoing: bool,
     linger: Option<Linger>,
     /// The socket writer found the connection closed: the session ends when

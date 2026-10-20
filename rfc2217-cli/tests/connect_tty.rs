@@ -1,8 +1,8 @@
 //! `rfc2217 connect` on a terminal (Unix). The binary runs in a session of
 //! its own with a pty as its controlling terminal, as it would on a user's
 //! terminal: without one, Ctrl-C never raises SIGINT, and a CLI that left
-//! ISIG on would pass every test (critic finding cc-4). A CI runner has no
-//! terminal at all, so the test makes its own pty.
+//! ISIG on would pass every test. A CI runner has no terminal at all, so the
+//! test makes its own pty.
 //!
 //! The test types on the master; the CLI's stdout is the slave, so what the
 //! echo bridge sends back shows up on the master. stderr is a pipe, which
