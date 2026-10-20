@@ -10,7 +10,10 @@
 # rfc2217-cli is a workspace of its own, with its own Cargo.lock, which records
 # the library's version. A commit that changes the library's version must also
 # update that lockfile (`cargo update -p rfc2217 --manifest-path
-# rfc2217-cli/Cargo.toml`), or every --locked command here fails.
+# rfc2217-cli/Cargo.toml`), or every --locked command here fails. A
+# semver-incompatible version (0.1.x to 0.2.0) must also raise the `rfc2217`
+# requirement in rfc2217-cli/Cargo.toml in the same commit, or the CLI does not
+# resolve at all.
 name: CI rfc2217-cli
 
 on:

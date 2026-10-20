@@ -201,13 +201,15 @@ the bridge and copies the data between the two, until the bridge closes the
 connection (exit code 1) or `rfc2217` is stopped. A program opens the pty as
 if it were a serial port.
 
-`--link PATH` also makes the pty reachable at PATH, through a symlink that is
-removed when `rfc2217` exits. Use a path you can write, such as `~/ttyRFC0` or
+The pty's own path (`/dev/pts/N` on Linux, `/dev/ttysNNN` on macOS) changes
+from run to run; `rfc2217 pty` reports it when it starts. `--link PATH` also
+makes the pty reachable at a fixed PATH, through a symlink that is removed when
+`rfc2217` exits. Use a path you can write, such as `~/ttyRFC0` or
 `/tmp/ttyRFC0`, never `/dev`: that needs root, and a pty made by root cannot be
-opened by other users. Port lists (IDE port pickers, pyserial's `list_ports`) show neither the
-pty nor the link, so give programs the path. If `rfc2217` is killed with
-SIGKILL, the link stays behind: remove it, because pty numbers are reused and
-a stale link soon points at an unrelated terminal.
+opened by other users. Port lists (IDE port pickers, pyserial's `list_ports`)
+show neither the pty nor the link, so give programs the path. If `rfc2217` is
+killed with SIGKILL, the link stays behind: remove it, because pty numbers are
+reused and a stale link soon points at an unrelated terminal.
 
 The line settings on the command line are sent when the session starts, as for
 `connect`, and the negotiation is checked the same way. After that,
@@ -223,8 +225,9 @@ remote lines once connected.
   parity whenever a program changes the settings, so what the program asks for
   never reaches `rfc2217`; depending on its C library and on what else the
   same call changes, the program's request is dropped silently or fails with
-  `EINVAL`. 1.5 stop bits and DCD/DSR flow control cannot be expressed through
-  a pty at all.
+  `EINVAL`. 1.5 stop bits and DCD/DSR flow control are not read from the pty
+  either: termios has no 1.5 stop bits, and of the flow control only RTS/CTS
+  and XON/XOFF are read.
 - **No DTR, RTS, BREAK or modem lines.** A pty has none: the program cannot
   set DTR or RTS, send a BREAK, or read CTS, DSR, CD and RI. So tools that
   reset a board through DTR and RTS do not work through the pty: esptool,
