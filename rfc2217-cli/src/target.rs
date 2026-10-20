@@ -93,7 +93,7 @@ impl Target {
                     return Ok(stream);
                 }
                 Err(e) => {
-                    tracing::debug!("{addr}: {e}");
+                    tracing::debug!(target: crate::ui::LOG, "{addr}: {e}");
                     last = Some(e);
                 }
             }

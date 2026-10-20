@@ -9,7 +9,11 @@ mod cli;
 mod connect;
 #[cfg(unix)]
 mod pty;
+mod session;
+mod shutdown;
 mod target;
+#[cfg(unix)]
+mod term;
 mod ui;
 
 use cli::{Cli, Command};
@@ -23,6 +27,8 @@ pub(crate) enum Exit {
     /// 1: an I/O error during the session.
     Io,
     /// 2: a usage error (clap uses 2 for its own as well).
+    // Only the Windows paths (an interactive `connect`, `pty`) construct it.
+    #[cfg_attr(unix, allow(dead_code))]
     Usage,
     /// 3: the host could not be resolved or did not accept the connection.
     Connect,
@@ -49,15 +55,21 @@ impl From<Exit> for ExitCode {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     ui::init(cli.verbose, cli.quiet);
-    match cli.command {
+    shutdown::install();
+    let exit = match cli.command {
         Command::Connect(args) => connect::run(args),
         #[cfg(unix)]
         Command::Pty(args) => pty::run(args),
         #[cfg(not(unix))]
         Command::Pty(_) => {
-            ui::error("pty needs a Unix system (Linux or macOS); on Windows, use a virtual COM port driver");
+            ui::error(
+                "pty needs a Unix system (Linux or macOS); on Windows, use a virtual COM port driver",
+            );
             Exit::Usage
         }
-    }
-    .into()
+    };
+    // Every way out of a subcommand comes back here; signals and panics run
+    // the same cleanup from their own paths (see `shutdown`).
+    shutdown::run_all();
+    exit.into()
 }

@@ -14,6 +14,11 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+/// The target of the CLI's own log events. The binary's crate is named
+/// `rfc2217`, like the library, so the default target (the module path)
+/// would put them under the library's filter: every event names this one.
+pub(crate) const LOG: &str = "rfc2217_cli";
+
 static RAW: AtomicBool = AtomicBool::new(false);
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Normal as u8);
 
@@ -45,7 +50,7 @@ pub(crate) fn init(verbose: u8, quiet: bool) {
         _ => (LevelFilter::TRACE, LevelFilter::TRACE),
     };
     let filter = Targets::new()
-        .with_target("rfc2217_cli", cli)
+        .with_target(LOG, cli)
         .with_target("rfc2217", lib);
     let fmt = tracing_subscriber::fmt::layer()
         .with_writer(Stderr)
@@ -64,6 +69,8 @@ pub(crate) fn level() -> Level {
 }
 
 /// Raw mode on or off for everything written to stderr from now on.
+// Only Unix has a raw mode (see term.rs).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn set_raw(on: bool) {
     RAW.store(on, Ordering::Relaxed);
 }

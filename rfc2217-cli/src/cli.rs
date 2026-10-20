@@ -309,6 +309,8 @@ pub(crate) enum Enter {
 }
 
 impl Enter {
+    // Only the interactive terminal, which is Unix-only, reads keys.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn bytes(self) -> &'static [u8] {
         match self {
             Self::Cr => b"\r",
@@ -324,6 +326,8 @@ pub(crate) struct Escape(pub(crate) Option<u8>);
 
 impl Escape {
     /// How the key is written in messages, e.g. `^]`.
+    // Only the interactive terminal, which is Unix-only, shows it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn caret(byte: u8) -> String {
         format!("^{}", char::from(byte ^ 0x40))
     }
@@ -354,7 +358,8 @@ fn parse_secs(s: &str) -> Result<Duration, String> {
     s.parse::<f64>()
         .ok()
         .filter(|secs| secs.is_finite() && *secs >= 0.0)
-        .map(Duration::from_secs_f64)
+        // Not `from_secs_f64`, which panics beyond u64::MAX seconds.
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
         .ok_or_else(|| format!("`{s}` is not a number of seconds"))
 }
 
