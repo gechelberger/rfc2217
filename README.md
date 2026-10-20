@@ -62,6 +62,17 @@ rfc2217 = { version = "0.1", default-features = false }
 
 The minimum supported Rust version is 1.85.
 
+## Command-line tool
+
+[rfc2217-cli](rfc2217-cli/README.md) installs `rfc2217`, a serial terminal
+for remote RFC 2217 ports and a local pseudo-terminal bridge, built on this
+crate:
+
+```sh
+cargo install --locked rfc2217-cli
+rfc2217 connect 192.168.1.50 -b 115200
+```
+
 ## Quick start
 
 A blocking client over `std::net::TcpStream`, on the alloc layer. It gives up
