@@ -14,8 +14,9 @@ use crate::target::Target;
 #[derive(Debug, Parser)]
 #[command(name = "rfc2217", version, propagate_version = true)]
 pub(crate) struct Cli {
-    /// More diagnostics on stderr: -v the bridge's events, -vv protocol
-    /// debug logs, -vvv a trace of every exchange.
+    /// More diagnostics on stderr: -v the bridge's events, -vv also the
+    /// library's notes on protocol oddities, -vvv also its trace of each
+    /// decoded reply.
     #[arg(short, long, action = ArgAction::Count, global = true)]
     pub(crate) verbose: u8,
     /// Only errors on stderr.

@@ -40,7 +40,11 @@ struct Run {
 impl Run {
     /// Starts `rfc2217 pty args` and waits for the path on stdout.
     fn start(args: &[&str]) -> Self {
-        let mut child = spawn(args);
+        Self::wait_for_path(spawn(args))
+    }
+
+    /// Waits for the path on stdout of `child`, a `rfc2217 pty`.
+    fn wait_for_path(mut child: Child) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let stdout = thread::spawn(move || {
@@ -271,6 +275,58 @@ fn the_link_points_at_the_pty_and_goes_on_a_signal() {
     let (status, stderr) = run.stop(Signal::INT);
     assert_eq!(status.code(), Some(130), "{stderr}");
     assert!(!exists(&link), "the link is left behind");
+}
+
+#[test]
+fn the_link_appears_once_the_bridge_has_answered() {
+    // A script waiting for the link finds the pty with the bridge's rate.
+    let bridge = Bridge::start(Options {
+        answer_after: Duration::from_millis(600),
+        ..Options::default()
+    });
+    let link = scratch("late").join("ttyRFC0");
+    let child = spawn(&[&bridge.target(), "--link", link.to_str().unwrap()]);
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !exists(&link),
+        "the link is there before the bridge answered"
+    );
+    let run = Run::wait_for_path(child);
+    assert_eq!(fs::read_link(&link).expect("the link"), run.path);
+    assert_eq!(Program::open(&link).termios().output_speed(), 115_200);
+    let (status, stderr) = run.stop(Signal::TERM);
+    assert_eq!(status.code(), Some(143), "{stderr}");
+    assert!(!exists(&link), "the link is left behind");
+}
+
+#[test]
+fn an_ignored_hangup_stays_ignored() {
+    // As `nohup` leaves it: the bridge must outlive the terminal.
+    let bridge = Bridge::echo();
+    let child = Command::new("sh")
+        .args([
+            "-c",
+            "trap '' HUP; exec \"$0\" pty \"$1\"",
+            BIN,
+            &bridge.target(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the CLI through sh");
+    let mut run = Run::wait_for_path(child);
+    kill_process(Pid::from_child(&run.child), Signal::HUP).expect("SIGHUP");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        run.child.try_wait().expect("try_wait").is_none(),
+        "SIGHUP ended it"
+    );
+    let program = Program::open(&run.path);
+    program.write(b"still here");
+    assert_eq!(program.read_exactly(10), b"still here");
+    let (status, stderr) = run.stop(Signal::TERM);
+    assert_eq!(status.code(), Some(143), "{stderr}");
 }
 
 #[test]

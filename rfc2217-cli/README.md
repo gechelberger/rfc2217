@@ -25,7 +25,7 @@ on that too with `--strict`. The library's client is tested against ser2net
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
 | `connect`, interactive | yes | yes | not yet |
-| `connect`, piped or redirected input | yes | yes | yes |
+| `connect`, piped or redirected input | yes | yes | yes, output redirected too |
 | `pty` | yes | yes, untested so far | no |
 
 ## Install
@@ -124,10 +124,13 @@ outcome is settled, and sent only if the session goes on.
 | --- | --- |
 | 0 | You quit, the input ended (after `--linger`), or the bridge closed the connection (`connect`) |
 | 1 | An I/O error during the session (for `pty`, also the bridge closing the connection), or `pty` could not create the pty or its `--link` |
-| 2 | A usage error, including interactive `connect` on Windows and `pty` on systems other than Linux and macOS |
+| 2 | A usage error, including `connect` on a Windows console and `pty` on systems other than Linux and macOS |
 | 3 | The host could not be resolved, or did not accept the connection |
 | 4 | Negotiation failed, as in the table above |
 | 128 + N | Stopped by signal N (143 for SIGTERM) |
+
+SIGHUP, SIGINT and SIGQUIT that were ignored when `rfc2217` started stay
+ignored, as `nohup` and background jobs in scripts expect.
 
 Scripts can rely on these codes: they change only in a minor release.
 
@@ -157,6 +160,9 @@ or `none`; the notice at the start of the session names it.
 | Ctrl-] `?` | Help |
 | Ctrl-] Ctrl-] | Send Ctrl-] itself |
 
+- The keys that act on the port (`b`, `d`, `r`, `p`, `u`, `n`) wait for the
+  negotiation, like typed data: until the bridge has answered they are
+  refused with a notice, so that they never overtake the keys typed before.
 - `u` and `n` step from the requested baud rate, or from the rate the bridge
   reported when it is `keep`.
 - The status shows whether RFC 2217 is active, whether the settings are
@@ -186,9 +192,10 @@ echo "exit code $?"
 printf 'STATUS\r' | rfc2217 connect bridge.local -b 19200 --frame 7E1 --strict --timeout 5
 ```
 
-On Windows, `connect` works in this mode only. With a console on stdin it
-exits with code 2 and says that interactive sessions are not supported on
-Windows yet; pipe the input instead:
+On Windows, `connect` works in this mode only, with stdout redirected too: a
+console on stdin or on stdout makes it exit with code 2 (interactive sessions
+are not supported on Windows yet, and the console takes only text), so pipe
+the input in and redirect the output:
 
 ```text
 type commands.txt | rfc2217 connect bridge.local -b 9600 > reply.txt
@@ -206,7 +213,8 @@ The pty's own path (`/dev/pts/N` on Linux, `/dev/ttysNNN` on macOS) changes
 from run to run. `rfc2217 pty` prints it on stdout once the bridge has
 answered, as the only line it ever writes there (`-q` does not hide it), for
 scripts to read. `--link PATH` also makes the pty reachable at a fixed PATH,
-through a symlink that is removed when `rfc2217` exits. Use a path you can
+through a symlink made at the same moment (a path in the way is refused
+before connecting) and removed when `rfc2217` exits. Use a path you can
 write, such as `~/ttyRFC0` or `/tmp/ttyRFC0`, never `/dev`: that needs root,
 and a pty made by root cannot be opened by other users. Port lists (IDE port pickers, pyserial's `list_ports`)
 show neither the pty nor the link, so give programs the path. If `rfc2217` is
@@ -264,7 +272,8 @@ pyserial-based tools can use an `rfc2217://host:port` URL.
 Global, for both subcommands:
 
 - `-v`, `-vv`, `-vvv`: more diagnostics on stderr: the bridge's events, then
-  the library's protocol debug logs, then a trace of every exchange.
+  the library's notes on protocol oddities it ignored, then its trace of each
+  decoded reply from the bridge.
 - `-q`: errors only.
 
 Both `connect` and `pty` take the line settings above (`-b`, `-d`,

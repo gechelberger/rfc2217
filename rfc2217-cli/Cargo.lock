@@ -207,6 +207,7 @@ name = "rfc2217-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "rfc2217",
  "rustix",
  "signal-hook",

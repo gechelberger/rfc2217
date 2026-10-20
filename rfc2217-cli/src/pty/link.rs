@@ -64,23 +64,12 @@ impl Link {
     /// rather than replacing it.
     pub(crate) fn create(path: &Path, device: &Path) -> io::Result<Self> {
         let path = std::path::absolute(path).map_err(context("the link path", path))?;
-        let replaced = match fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(context("checking the link path", &path)(e)),
-            Ok(meta) if meta.file_type().is_symlink() && is_stale(&path, device) => {
-                let old = fs::read_link(&path).map_err(context("reading the old link", &path))?;
-                fs::remove_file(&path).map_err(context("removing the old link", &path))?;
-                Some(old)
-            }
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "{} already exists and is not a stale link to a pseudo-terminal; remove it or choose another path",
-                        path.display()
-                    ),
-                ));
-            }
+        let replaced = if occupied(&path, device)? {
+            let old = fs::read_link(&path).map_err(context("reading the old link", &path))?;
+            fs::remove_file(&path).map_err(context("removing the old link", &path))?;
+            Some(old)
+        } else {
+            None
         };
         symlink(device, &path).map_err(context("creating the link", &path))?;
         Ok(Self {
@@ -89,6 +78,14 @@ impl Link {
             replaced,
             done: Mutex::new(false),
         })
+    }
+
+    /// Fails as [`create`](Self::create) would if it ran now, without
+    /// changing anything: to refuse a path in the way before connecting,
+    /// and create the link only once the bridge has answered.
+    pub(crate) fn check(path: &Path, device: &Path) -> io::Result<()> {
+        let path = std::path::absolute(path).map_err(context("the link path", path))?;
+        occupied(&path, device).map(drop)
     }
 
     /// The link's own path (absolute).
@@ -138,6 +135,24 @@ impl Drop for Link {
             )),
             Err(e) => crate::ui::warn(e),
         }
+    }
+}
+
+/// What is at `path`: nothing (`false`), or a stale link that may be
+/// replaced (`true`); anything else is an [`io::ErrorKind::AlreadyExists`].
+fn occupied(path: &Path, device: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(context("checking the link path", path)(e)),
+        Ok(meta) if meta.file_type().is_symlink() && is_stale(path, device) => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists and is not a stale link to a pseudo-terminal; remove it or \
+                 choose another path",
+                path.display()
+            ),
+        )),
     }
 }
 

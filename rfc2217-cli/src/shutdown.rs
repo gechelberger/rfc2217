@@ -18,6 +18,10 @@
 //!   (review finding cn-4), and with the terminal restored under it, it
 //!   would carry on with local echo and Ctrl-C killing it.
 //!
+//! A signal that was ignored when the process started stays ignored, as
+//! `nohup` and a shell's background jobs expect: SIGHUP, SIGINT and SIGQUIT
+//! are caught only if they were not. SIGTERM is always caught.
+//!
 //! On other systems no signals are caught (Ctrl-C ends the process, and no
 //! terminal is in raw mode there); panics still run the registry.
 
@@ -197,7 +201,11 @@ fn catch_signals() {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
     use signal_hook::iterator::Signals;
 
-    let mut signals = match Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT]) {
+    let caught = [SIGINT, SIGHUP, SIGQUIT]
+        .into_iter()
+        .filter(|&signal| !ignored(signal))
+        .chain([SIGTERM]);
+    let mut signals = match Signals::new(caught) {
         Ok(signals) => signals,
         Err(e) => {
             ui::warn(format_args!(
@@ -222,12 +230,27 @@ fn catch_signals() {
                 // registry and exits, unless something keeps it.
                 std::thread::sleep(GRACE);
             }
+            // Not even through a cleanup action's warning.
+            ui::silence();
             REGISTRY.run_all();
             std::process::exit(128 + signal);
         });
     if let Err(e) = spawned {
         ui::warn(format_args!("cannot catch signals: {e}"));
     }
+}
+
+/// Whether `signal` was ignored when the process started (`SIG_IGN`).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn ignored(signal: i32) -> bool {
+    let mut old = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: with a null new action, sigaction only reads the current one
+    // into `old`, which is valid for writes; nothing changes.
+    let read = unsafe { libc::sigaction(signal, std::ptr::null(), old.as_mut_ptr()) } == 0;
+    // SAFETY: zeroed is a valid sigaction (plain integers and pointers), and
+    // a successful call filled it in.
+    read && unsafe { old.assume_init() }.sa_sigaction == libc::SIG_IGN
 }
 
 #[cfg(test)]

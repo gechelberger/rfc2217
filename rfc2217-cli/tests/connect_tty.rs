@@ -28,7 +28,7 @@ use rfc2217::ServerEvent;
 use rustix::fs::{Mode, OFlags};
 use rustix::process::{Pid, Signal, kill_process};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
-use rustix::termios::{LocalModes, SpecialCodeIndex, Termios, tcgetattr};
+use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr};
 
 /// The escape key, ^].
 const ESC: u8 = 0x1D;
@@ -330,10 +330,39 @@ fn a_break_asked_for_while_negotiating_is_not_cut_short() {
 }
 
 #[test]
+fn a_command_waits_for_the_negotiation_with_the_keys_typed_before_it() {
+    // Typed keys are held until the bridge has answered; a DTR change sent
+    // meanwhile would reach the device before them.
+    let bridge = Bridge::start(Options {
+        answer_after: Duration::from_millis(600),
+        ..Options::default()
+    });
+    let pty = pty();
+    let mut session = Session::connect(&pty, &bridge);
+    session.type_keys(&[b'a', ESC, b'd']);
+    session.expect_message("no DTR yet");
+    session.expect(b"a");
+    session.type_keys(&[ESC, b'q']);
+    let (status, stderr) = session.exit();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    let report = bridge.finish();
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Dtr(_))),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(report.data, b"a");
+}
+
+#[test]
 fn escape_d_and_r_toggle_dtr_and_rts() {
     let bridge = Bridge::echo();
     let pty = pty();
     let mut session = Session::connect(&pty, &bridge);
+    session.settle();
     // Typed in one go, then a byte that comes back after the commands.
     session.type_keys(&[ESC, b'd', ESC, b'r', ESC, b'd', b'.']);
     session.expect(b".");
@@ -429,6 +458,77 @@ fn sigterm_is_exit_143_with_the_terminal_restored() {
     let (status, stderr) = session.exit();
     assert_eq!(status.code(), Some(143), "{status:?} {stderr}");
     assert_restored(&pty);
+}
+
+#[test]
+fn a_signal_ends_a_break_in_progress() {
+    let bridge = Bridge::echo();
+    let pty = pty();
+    let mut session = Session::connect(&pty, &bridge);
+    session.settle();
+    session.type_keys(&[ESC, b'b']);
+    session.expect_message("BREAK for");
+    kill_process(Pid::from_child(&session.child), Signal::TERM).expect("kill");
+    let (status, stderr) = session.exit();
+    assert_eq!(status.code(), Some(143), "{status:?} {stderr}");
+    let events = bridge.finish().events;
+    assert!(
+        events.ends_with(&[ServerEvent::Break(true), ServerEvent::Break(false)]),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_stop_from_outside_comes_back_to_raw_mode() {
+    // A shell puts its own settings back when a job stops.
+    let bridge = Bridge::echo();
+    let pty = pty();
+    let mut session = Session::connect(&pty, &bridge);
+    session.settle();
+    let pid = Pid::from_child(&session.child);
+    kill_process(pid, Signal::STOP).expect("SIGSTOP");
+    rustix::termios::tcsetattr(&pty.slave, OptionalActions::Now, &pty.before)
+        .expect("the shell's settings");
+    kill_process(pid, Signal::CONT).expect("SIGCONT");
+    wait_raw(&pty);
+    session.type_keys(b"x\x03y");
+    session.expect(b"x\x03y");
+    session.type_keys(&[ESC, b'q']);
+    let (status, stderr) = session.exit();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_restored(&pty);
+}
+
+#[test]
+fn a_stop_past_the_deadline_is_no_timeout() {
+    // The bridge answered while the process was stopped: its answer is
+    // waiting in the socket when the deadline is found long past. Whether
+    // the owner looks at the deadline before the socket reader has run again
+    // is up to the scheduler: without the grace for a late deadline, this
+    // fails in some runs only (after `z` it fails every time, but here the
+    // process group is orphaned and the kernel discards SIGTSTP).
+    let bridge = Bridge::start(Options {
+        answer_after: Duration::from_millis(200),
+        ..Options::default()
+    });
+    let mut child = Command::new(BIN)
+        .args(["connect", &bridge.target(), "--timeout", "0.5"])
+        .args(["--linger", "0.2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the CLI");
+    let mut stderr = Feed::new(child.stderr.take().expect("piped stderr"));
+    // The notice comes as the session starts: its deadline runs from then.
+    stderr.expect("stderr", b"setting the port to 8N1");
+    let pid = Pid::from_child(&child);
+    kill_process(pid, Signal::STOP).expect("SIGSTOP");
+    thread::sleep(Duration::from_millis(1200));
+    kill_process(pid, Signal::CONT).expect("SIGCONT");
+    drop(child.stdin.take());
+    let status = wait(&mut child);
+    assert_eq!(status.code(), Some(0), "{}", stderr.all());
 }
 
 #[test]

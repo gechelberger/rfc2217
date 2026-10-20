@@ -5,9 +5,14 @@
 
 mod common;
 
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
-use common::{Bridge, Options, Script, Seen, closed_port, run, run_open, scripted};
+use common::{
+    BIN, Bridge, Options, Script, Seen, closed_port, read_all, run, run_open, scripted, wait,
+};
 use rfc2217::{DataBits, FlowControl, Parity, PortSettings, ServerEvent, StopBits};
 
 /// Long enough for an echo over loopback, short enough for a fast suite.
@@ -64,6 +69,45 @@ fn the_linger_waits_for_late_output() {
     assert_eq!(out.code(), Some(0), "{}", out.stderr);
     assert_eq!(out.stdout, b"AT\r");
     assert!(out.took >= Duration::from_millis(400), "{:?}", out.took);
+}
+
+#[test]
+fn the_linger_waits_for_a_slow_reader() {
+    // While stdout's reader is behind, the CLI stops reading the socket: the
+    // port's output waits there unread, which is not the port being quiet.
+    let bridge = Bridge::echo();
+    let input = noise(1 << 19);
+    let mut child = Command::new(BIN)
+        .args(["connect", &bridge.target(), "--linger", "0.2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the CLI");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let writer = thread::spawn({
+        let input = input.clone();
+        move || {
+            let _ = stdin.write_all(&input);
+        }
+    });
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = thread::spawn(move || {
+        let (mut got, mut buf) = (Vec::new(), vec![0; 64 * 1024]);
+        while let Ok(n @ 1..) = stdout.read(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+            thread::sleep(Duration::from_millis(300));
+        }
+        got
+    });
+    let stderr = read_all(child.stderr.take().expect("piped stderr"));
+    let status = wait(&mut child);
+    writer.join().expect("stdin writer");
+    let stderr = String::from_utf8_lossy(&stderr.join().unwrap()).into_owned();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    let got = reader.join().expect("stdout reader");
+    assert_eq!(got.len(), input.len(), "{stderr}");
+    assert!(got == input, "the data came back changed");
 }
 
 #[test]
@@ -332,6 +376,20 @@ fn input_waits_while_the_bridge_suspends_the_flow() {
         resumed.is_some() && data > resumed,
         "the data came before the resume: {:?}",
         report.seen
+    );
+}
+
+#[test]
+fn a_bridge_that_hangs_up_before_answering_is_exit_4() {
+    // Nothing was negotiated, and the input held until then never went.
+    let peer = scripted(Script::Hangup).to_string();
+    let out = run(&["connect", &peer], b"reboot\r");
+    assert_eq!(out.code(), Some(4), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("closed the connection before answering the RFC 2217 offer"),
+        "{}",
+        out.stderr
     );
 }
 

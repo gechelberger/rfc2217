@@ -9,14 +9,23 @@
 //! Only stdin's terminal is touched, and only when stdin is one: a pipe on
 //! stdin must not put the controlling terminal into raw mode behind the
 //! user's back (finding cn-4).
+//!
+//! A stop from outside (`kill -STOP`, or SIGTSTP from another process) lets
+//! the shell put its own settings back; on SIGCONT raw mode is set again.
 
 use std::io;
+use std::sync::{Mutex, Once, PoisonError};
 
 use rustix::stdio::stdin;
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcsetattr};
 
 use crate::shutdown::{self, Cleanup};
 use crate::ui;
+
+/// The settings to restore while raw mode is on, for the SIGCONT thread.
+/// The lock also orders a SIGCONT against the final restore, so that the
+/// terminal never ends up raw after it.
+static SAVED: Mutex<Option<Termios>> = Mutex::new(None);
 
 /// Stdin's terminal in raw mode. The settings it had before are restored
 /// when this is dropped, and by the cleanup registry however else the
@@ -34,13 +43,20 @@ impl RawMode {
     /// If stdin is not a terminal, or its settings cannot be read or set.
     pub(crate) fn enter() -> io::Result<Self> {
         let saved = tcgetattr(stdin())?;
+        *lock_saved() = Some(saved.clone());
         let restore = shutdown::register({
             let saved = saved.clone();
-            move || restore(&saved)
+            move || {
+                let mut current = lock_saved();
+                *current = None;
+                restore(&saved);
+            }
         });
         let raw = Self { saved, restore };
         // On an error the restore runs on drop: harmless, nothing changed.
         make_raw(&raw.saved)?;
+        static CONTINUE: Once = Once::new();
+        CONTINUE.call_once(raw_again_on_continue);
         Ok(raw)
     }
 
@@ -64,6 +80,44 @@ impl RawMode {
 impl Drop for RawMode {
     fn drop(&mut self) {
         shutdown::run(self.restore);
+    }
+}
+
+/// A panic anywhere ends the process, so a poisoned lock only means that the
+/// thread holding it is gone.
+fn lock_saved() -> std::sync::MutexGuard<'static, Option<Termios>> {
+    SAVED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Sets raw mode again on every SIGCONT while it is on. After `z` the
+/// suspend itself does too; twice is harmless.
+fn raw_again_on_continue() {
+    use signal_hook::consts::SIGCONT;
+    use signal_hook::iterator::Signals;
+
+    let mut signals = match Signals::new([SIGCONT]) {
+        Ok(signals) => signals,
+        Err(e) => {
+            ui::warn(format_args!(
+                "cannot catch SIGCONT ({e}): after a stop from outside, the terminal stays as \
+                 the shell left it"
+            ));
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("continue".into())
+        .spawn(move || {
+            for _ in signals.forever() {
+                if let Some(saved) = lock_saved().as_ref() {
+                    // Continued in the background (`bg`), this stops the
+                    // process again (SIGTTOU) until `fg`, and then succeeds.
+                    let _ = make_raw(saved);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        ui::warn(format_args!("cannot catch SIGCONT: {e}"));
     }
 }
 

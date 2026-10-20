@@ -50,10 +50,10 @@ The first release, built on rfc2217 0.1.
   tried; TCP keepalive notices a bridge that disappears.
 - Exit codes: 0 for a normal end, 1 an I/O error, 2 a usage error, 3 could not
   resolve or connect, 4 negotiation failed, 128+N stopped by signal N.
-- `-v`, `-vv` and `-vvv` for the bridge's events, the library's protocol debug
-  logs and a trace of every exchange; `-q` for errors only. Messages and logs
-  go to stderr; stdout carries only the port's data (`connect`) or the pty's
-  path (`pty`).
+- `-v`, `-vv` and `-vvv` for the bridge's events, the library's notes on
+  protocol oddities and its trace of each decoded reply; `-q` for errors only.
+  Messages and logs go to stderr; stdout carries only the port's data
+  (`connect`) or the pty's path (`pty`).
 
 ### Behaviour worth knowing
 
@@ -77,7 +77,8 @@ The first release, built on rfc2217 0.1.
   pty driver forces 8 data bits and no parity); a pty has no DTR, RTS, BREAK
   or modem lines, so tools that reset a board through them do not work; it is
   not paced by the baud rate. On macOS it has not run on a Mac yet.
-- Windows: `connect` with piped or redirected input only, and no `pty`.
+- Windows: `connect` with piped or redirected input and output only, and no
+  `pty`.
 - No `serve` (sharing a local serial port) and no reconnecting yet.
 
 [Unreleased]: https://github.com/gechelberger/rfc2217/compare/rfc2217-cli-v0.1.0...HEAD

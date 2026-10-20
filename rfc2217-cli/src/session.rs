@@ -34,7 +34,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rfc2217::{
-    Client, DataBits, Event, FlowControl, NotReady, Parity, PartialSettings, PortSettings, StopBits,
+    Client, ComPortState, DataBits, Event, FlowControl, NotReady, Parity, PartialSettings,
+    PortSettings, StopBits,
 };
 
 use crate::Exit;
@@ -57,6 +58,24 @@ const FOREVER: Duration = Duration::from_secs(1 << 32);
 /// write what is still queued (typed just before the quit key, say). A
 /// bridge that stopped reading must not keep the process alive.
 const NET_DRAIN: Duration = Duration::from_secs(1);
+
+/// The same after a signal: short, well within the signal thread's grace
+/// (see `shutdown`), but long enough for a last command such as the end of
+/// a BREAK.
+const SIGNAL_DRAIN: Duration = Duration::from_millis(250);
+
+/// What may wait for the socket before the session gives up. Throttled
+/// input stays near [`LIMIT`], so only a bridge that sends requests and
+/// never reads the replies gets here; without a cap, those replies would
+/// fill the memory.
+const NET_CAP: usize = 16 * LIMIT;
+
+/// A deadline found this late passed while the process was not running
+/// (stopped, say): what the bridge sent meanwhile has not been read yet.
+const LATE: Duration = Duration::from_millis(100);
+
+/// How long such a deadline is put off, once, for that.
+const LATE_GRACE: Duration = Duration::from_millis(200);
 
 /// `from + wait`, for any wait the command line accepts.
 fn after(from: Instant, wait: Duration) -> Instant {
@@ -161,6 +180,12 @@ pub(crate) trait Local {
     /// How the session ends when the bridge closes the connection: `connect`
     /// is done ([`Exit::Ok`]), while `pty` lost its port ([`Exit::Io`]).
     fn remote_closed(&self) -> Exit;
+
+    /// The session is ending, however it ends (a signal included): the last
+    /// chance to send something, such as the end of a BREAK.
+    fn ending(&mut self, ctl: &mut Ctl) {
+        let _ = ctl;
+    }
 }
 
 /// What the local end may do with the session: the owner's state, lent to
@@ -210,6 +235,20 @@ impl Ctl {
     /// through [`set_port_settings`](Self::set_port_settings) instead.
     pub(crate) fn client(&mut self) -> &mut Client {
         &mut self.client
+    }
+
+    /// Whether the readiness policy has let the session go on: until then,
+    /// data for the port is held.
+    pub(crate) fn settled(&self) -> bool {
+        self.settled
+    }
+
+    /// Hands what can go to the socket writer and waits up to `timeout` for
+    /// it to be written: before the process stops (all its threads stop
+    /// with it). Input not handled yet counts as unwritten.
+    pub(crate) fn wait_sent(&mut self, timeout: Duration) {
+        self.flush();
+        self.net.gate.wait_empty(after(Instant::now(), timeout));
     }
 
     /// Asks the bridge for new line settings; what it answers is reported
@@ -381,6 +420,24 @@ impl Gate {
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
+
+    /// Waits until nothing is left, or until `deadline`.
+    fn wait_empty(&self, deadline: Instant) {
+        let mut bytes = self.lock();
+        while *bytes > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            // `sub` wakes the waiters whenever the count drops below the
+            // limit, so also when it reaches 0.
+            bytes = self
+                .below_limit
+                .wait_timeout(bytes, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
 }
 
 /// A writer thread's queue, and the gate that counts what is on its way
@@ -419,7 +476,7 @@ enum Msg {
     ReadError(Side, io::Error),
     WriteError(Side, io::Error),
     /// That side's writer has written everything handed to it so far.
-    Flushed(Side),
+    Flushed,
     /// That side's writer has ended: its queue was closed and written, or
     /// it failed.
     WriterDone(Side),
@@ -436,7 +493,7 @@ pub(crate) fn run(
 ) -> Exit {
     if !setup.line.framing_given() {
         ui::notice(
-            "setting the port to 8N1 without flow control: RFC 2217 cannot leave these as they are \
+            "setting the port to 8N1 without flow control: only the baud rate can be kept as it is \
              (choose with --frame and --flow)",
         );
     }
@@ -491,12 +548,16 @@ pub(crate) fn run(
         rx,
         setup,
         deadline: after(Instant::now(), setup.args.timeout),
+        regraced: false,
         echoing: false,
         linger: None,
+        closing: None,
         names: (input, output),
         drain,
     };
     let exit = engine.run();
+    engine.local.ending(&mut engine.ctl);
+    engine.ctl.flush();
     let exit = engine.finish(exit);
     drop(signals);
     exit
@@ -577,7 +638,7 @@ fn write(side: Side, mut sink: impl Write, rx: &Receiver<Vec<u8>>, gate: &Gate, 
             break;
         }
         if gate.sub(chunk.len()) == 0 {
-            let _ = tx.send(Msg::Flushed(side));
+            let _ = tx.send(Msg::Flushed);
         }
     }
     let _ = tx.send(Msg::WriterDone(side));
@@ -588,8 +649,10 @@ fn write(side: Side, mut sink: impl Write, rx: &Receiver<Vec<u8>>, gate: &Gate, 
 #[derive(Debug)]
 struct Linger {
     quiet: Duration,
-    /// The last time the port sent data, the socket writer emptied its
-    /// queue, or the input ended.
+    /// The last time the port sent data, a writer emptied its queue, or the
+    /// input ended. The local writer counts: while its queue is full, the
+    /// socket reader is paused and the port's output waits unread in the
+    /// socket, which is not the port being quiet.
     since: Instant,
 }
 
@@ -607,9 +670,16 @@ struct Engine<'a, L> {
     setup: Setup<'a>,
     /// Until when the negotiation may take.
     deadline: Instant,
+    /// The deadline was put off once already, after it was found long past
+    /// ([`LATE`]).
+    regraced: bool,
     /// The peer echoed one of our requests back (review finding vc-2).
     echoing: bool,
     linger: Option<Linger>,
+    /// The socket writer found the connection closed: the session ends when
+    /// the socket reader has delivered the rest (it may have the bridge's
+    /// last output), or at this time.
+    closing: Option<Instant>,
     /// [`LocalIo::input`] and [`LocalIo::output`].
     names: (&'static str, &'static str),
     /// [`LocalIo::drain`].
@@ -643,6 +713,14 @@ impl<L: Local> Engine<'_, L> {
             if let Some(exit) = exit {
                 return exit;
             }
+            if self.ctl.net.gate.get() > NET_CAP {
+                ui::error(format_args!(
+                    "{} does not read what is sent to it ({} KiB waiting)",
+                    self.setup.target,
+                    NET_CAP / 1024
+                ));
+                return Exit::Io;
+            }
         }
     }
 
@@ -660,12 +738,19 @@ impl<L: Local> Engine<'_, L> {
                 return Some(exit);
             }
         }
+        if self.closing.is_some_and(|at| now >= at) {
+            return Some(self.remote_closed(None));
+        }
         // Not before the policy has settled: an input that ended at once
         // must not turn a port that never answers into a success, nor end
-        // the session before the settings have gone out.
+        // the session before the settings have gone out. And not while
+        // anything is on its way: in either direction.
         match &self.linger {
             Some(linger)
-                if self.ctl.settled && now >= linger.end() && self.ctl.net.gate.get() == 0 =>
+                if self.ctl.settled
+                    && now >= linger.end()
+                    && self.ctl.net.gate.get() == 0
+                    && self.ctl.out.gate.get() == 0 =>
             {
                 ui::verbose("the input ended and the port is quiet");
                 Some(Exit::Ok)
@@ -680,14 +765,15 @@ impl<L: Local> Engine<'_, L> {
             .linger
             .as_ref()
             .map(Linger::end)
-            // Once it is over, what is left is the socket writer's queue,
-            // and its Flushed message wakes the owner.
+            // Once it is over, what is left is in the writers' queues, and
+            // their Flushed messages wake the owner.
             .filter(|&at| at > now);
         [
             (!self.ctl.settled).then_some(self.deadline),
             self.ctl.recheck,
             self.local.next_tick(),
             linger,
+            self.closing,
         ]
         .into_iter()
         .flatten()
@@ -707,6 +793,13 @@ impl<L: Local> Engine<'_, L> {
             return Some(Exit::Negotiation);
         }
         let late = now >= self.deadline;
+        if late && !self.regraced && now.saturating_duration_since(self.deadline) > LATE {
+            // The process was not running at the deadline (stopped by `z`
+            // or from outside): the bridge may have answered meanwhile.
+            self.regraced = true;
+            self.deadline = now + LATE_GRACE;
+            return None;
+        }
         let client = &self.ctl.client;
         let timeout = Secs(args.timeout);
         match client.readiness() {
@@ -779,8 +872,16 @@ impl<L: Local> Engine<'_, L> {
                 exit
             }
             Msg::End(Side::Net) => Some(self.remote_closed(None)),
-            Msg::ReadError(Side::Net, e) | Msg::WriteError(Side::Net, e) if closed_by_peer(&e) => {
-                Some(self.remote_closed(Some(e)))
+            Msg::ReadError(Side::Net, e) if closed_by_peer(&e) => Some(self.remote_closed(Some(e))),
+            // The socket reader may still have the bridge's last output: the
+            // session ends when it reaches the end of the stream, or once the
+            // local writer's drain time has passed.
+            Msg::WriteError(Side::Net, e) if closed_by_peer(&e) => {
+                ui::verbose(format_args!("writing to {target}: {e}"));
+                if self.closing.is_none() {
+                    self.closing = Some(after(Instant::now(), self.drain.unwrap_or(FOREVER)));
+                }
+                None
             }
             Msg::ReadError(Side::Net, e) => {
                 ui::error(format_args!("reading from {target}: {e}"));
@@ -818,13 +919,13 @@ impl<L: Local> Engine<'_, L> {
                 ui::error(format_args!("writing {}: {e}", self.names.1));
                 Some(Exit::Io)
             }
-            Msg::Flushed(Side::Net) => {
+            Msg::Flushed => {
                 if let Some(linger) = &mut self.linger {
                     linger.since = Instant::now();
                 }
                 None
             }
-            Msg::Flushed(Side::Local) | Msg::WriterDone(_) => None,
+            Msg::WriterDone(_) => None,
             Msg::Signal(signal) => {
                 tracing::debug!(target: ui::LOG, "caught signal {signal}");
                 Some(Exit::Signal(signal))
@@ -874,6 +975,21 @@ impl<L: Local> Engine<'_, L> {
         if let Some(e) = error {
             ui::verbose(format_args!("the connection ended with: {e}"));
         }
+        // Nothing more will come: the policy decides now, as at its deadline.
+        if !self.ctl.settled {
+            if !self.echoing && self.ctl.client.com_port_state() == ComPortState::Negotiating {
+                ui::error(format_args!(
+                    "{} closed the connection before answering the RFC 2217 offer",
+                    self.setup.target
+                ));
+                return Exit::Negotiation;
+            }
+            let now = Instant::now();
+            self.deadline = now;
+            if let Some(exit) = self.negotiate(now) {
+                return exit;
+            }
+        }
         let exit = self.local.remote_closed();
         match exit {
             Exit::Ok => ui::notice("the bridge closed the connection"),
@@ -883,23 +999,24 @@ impl<L: Local> Engine<'_, L> {
     }
 
     /// Lets the writers finish: the socket writer for at most [`NET_DRAIN`],
-    /// the local writer as long as [`LocalIo::drain`] allows. A signal ends
-    /// this at once.
+    /// the local writer as long as [`LocalIo::drain`] allows. After a signal
+    /// only the socket writer, for at most [`SIGNAL_DRAIN`]; a signal during
+    /// the wait ends it at once.
     fn finish(self, exit: Exit) -> Exit {
-        if let Exit::Signal(_) = exit {
-            return exit;
-        }
+        let signalled = matches!(exit, Exit::Signal(_));
         let Self { ctl, rx, drain, .. } = self;
         // Closing the queues ends the writers once they wrote them out.
         let Ctl { net, out, .. } = ctl;
         drop((net, out));
         let start = Instant::now();
-        let (mut net_done, mut out_done) = (false, false);
+        let net_drain = if signalled { SIGNAL_DRAIN } else { NET_DRAIN };
+        // Nobody waits for the local writer after a signal.
+        let (mut net_done, mut out_done) = (false, signalled);
         while !(net_done && out_done) {
             let limit = if net_done {
                 drain.map(|drain| start + drain)
             } else {
-                Some(start + NET_DRAIN)
+                Some(start + net_drain)
             };
             let msg = match limit {
                 Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
@@ -908,7 +1025,7 @@ impl<L: Local> Engine<'_, L> {
             match msg {
                 Ok(Msg::WriterDone(Side::Net)) => net_done = true,
                 Ok(Msg::WriterDone(Side::Local)) => out_done = true,
-                Ok(Msg::Signal(signal)) => return Exit::Signal(signal),
+                Ok(Msg::Signal(signal)) if !signalled => return Exit::Signal(signal),
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) if !net_done => net_done = true,
                 Err(_) => break,

@@ -150,11 +150,14 @@ impl Pty {
     /// (`TIOCEXCL`; serialport-rs sets it on every open by default and clears
     /// it only when it closes the port itself, so after such a program was
     /// killed every open by a normal user would fail with EBUSY), and
-    /// output suspended with `tcflow(TCOOFF)`, which would make every write
-    /// of the next program block or fail. Called when the last program has
-    /// closed the device (Linux only: elsewhere nothing tells when that is).
+    /// output suspended with `tcflow(TCOOFF)` or by an XOFF from the port
+    /// (with IXON), which would make every write of the next program block
+    /// or fail. Called when the last program has closed the device (Linux
+    /// only: elsewhere nothing tells when that is).
     #[cfg(target_os = "linux")]
     pub(crate) fn reset_after_close(&self) -> io::Result<()> {
+        use rustix::termios::InputModes;
+
         termios::ioctl_tiocnxcl(&self.slave).map_err(failed(format_args!(
             "ending exclusive mode on {}",
             self.path.display()
@@ -162,7 +165,20 @@ impl Pty {
         termios::tcflow(&self.slave, termios::Action::OOn).map_err(failed(format_args!(
             "restarting the output of {}",
             self.path.display()
-        )))
+        )))?;
+        // TCOON does not undo an XOFF; turning IXON off does (n_tty restarts
+        // the output then), and the program's settings go back at once.
+        // IXOFF in between keeps them XON/XOFF flow control for the settings
+        // poll, and cannot send a STOP: the input queue was just flushed.
+        let termios = self.termios()?;
+        if termios.input_modes.contains(InputModes::IXON) {
+            let mut off = termios.clone();
+            off.input_modes -= InputModes::IXON;
+            off.input_modes |= InputModes::IXOFF;
+            self.set_termios(&off)?;
+            self.set_termios(&termios)?;
+        }
+        Ok(())
     }
 
     /// The termios the local program sees.

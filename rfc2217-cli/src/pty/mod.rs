@@ -70,16 +70,14 @@ pub(crate) fn run(args: PtyArgs) -> Exit {
         }
     };
     let (presence, opens) = watch_opens(&pty);
-    let link = match &args.link {
-        Some(path) => match Link::create(path, pty.path()) {
-            Ok(link) => Some(remove_on_exit(link)),
-            Err(e) => {
-                ui::error(e);
-                return Exit::Io;
-            }
-        },
-        None => None,
-    };
+    // Refused before connecting, made once the bridge has answered (see
+    // `Bridge::settled`).
+    if let Some(path) = &args.link {
+        if let Err(e) = Link::check(path, pty.path()) {
+            ui::error(e);
+            return Exit::Io;
+        }
+    }
     let stream = match args.target.connect() {
         Ok(stream) => stream,
         Err(e) => {
@@ -112,7 +110,8 @@ pub(crate) fn run(args: PtyArgs) -> Exit {
         watch,
         requested,
         target: args.target.clone(),
-        link,
+        link: args.link.clone(),
+        failed: false,
         next_poll: None,
         told_refused: false,
     };
@@ -266,7 +265,10 @@ struct Bridge {
     /// the program's changes applied.
     requested: PortSettings,
     target: Target,
+    /// `--link`, as given until it is made, then made absolute.
     link: Option<PathBuf>,
+    /// The link could not be made: the session ends at the next tick.
+    failed: bool,
     /// When to read the pty's settings next, from the moment the negotiation
     /// has settled: until then the command line's settings are on their way.
     next_poll: Option<Instant>,
@@ -303,10 +305,22 @@ impl Local for Bridge {
                 Line::from(client.reported_settings())
             ));
         }
+        // Only now, the link as the path, so that a program started on
+        // either the moment it appears sees the bridge's rate.
+        if let Some(link) = self.link.take() {
+            match Link::create(&link, self.pty.path()) {
+                Ok(link) => self.link = Some(remove_on_exit(link)),
+                Err(e) => {
+                    ui::error(e);
+                    self.failed = true;
+                    self.next_poll = Some(Instant::now());
+                    return;
+                }
+            }
+        }
         let path = self.pty.path().display();
-        // Only now, so that a program started on the path the moment it
-        // appears sees the bridge's rate. stdout carries nothing else, and
-        // `-q` does not hide it: scripts read the path from there.
+        // stdout carries nothing else, and `-q` does not hide it: scripts
+        // read the path from there.
         let mut stdout = io::stdout().lock();
         let _ = writeln!(stdout, "{path}").and_then(|()| stdout.flush());
         match &self.link {
@@ -325,6 +339,9 @@ impl Local for Bridge {
     }
 
     fn tick(&mut self, now: Instant, ctl: &mut Ctl) -> Option<Exit> {
+        if self.failed {
+            return Some(Exit::Io);
+        }
         self.next_poll = Some(now + SettingsWatch::INTERVAL);
         match self.watch.poll(&self.pty) {
             Ok(Some(update)) => self.changed(&update, ctl),

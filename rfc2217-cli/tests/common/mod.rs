@@ -345,6 +345,9 @@ pub(crate) enum Script {
     /// data flow over and over: a notice each time, which soon fills a
     /// stderr that nobody reads.
     FlowFlood,
+    /// A server that says why and closes before answering anything, as a
+    /// ser2net port another client has.
+    Hangup,
 }
 
 /// Starts a scripted peer for one connection.
@@ -360,8 +363,10 @@ pub(crate) fn scripted(script: Script) -> SocketAddr {
 }
 
 fn play(mut stream: TcpStream, script: Script) -> io::Result<()> {
-    if script == Script::Refuse {
-        stream.write_all(b"login: ")?;
+    match script {
+        Script::Refuse => stream.write_all(b"login: ")?,
+        Script::Hangup => return stream.write_all(b"Port already in use\r\n"),
+        _ => {}
     }
     let mut telnet = Telnet::default();
     let mut buf = [0; 4096];
@@ -377,7 +382,11 @@ fn play(mut stream: TcpStream, script: Script) -> io::Result<()> {
                 stream.write_all(input)?;
                 continue;
             }
-            Script::Refuse | Script::Mismatch | Script::NoStopBits | Script::FlowFlood => {}
+            Script::Refuse
+            | Script::Mismatch
+            | Script::NoStopBits
+            | Script::FlowFlood
+            | Script::Hangup => {}
         }
         let mut out = Vec::new();
         for &byte in input {

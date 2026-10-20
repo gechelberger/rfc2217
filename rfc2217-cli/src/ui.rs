@@ -20,8 +20,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub(crate) const LOG: &str = "rfc2217_cli";
 
 static RAW: AtomicBool = AtomicBool::new(false);
-/// In raw mode: the terminal's cursor is not at the start of a line.
+/// In raw mode: the last bytes shown did not end a line.
 static MID_LINE: AtomicBool = AtomicBool::new(false);
+/// Nothing more is written to stderr (see [`silence`]).
+static SILENT: AtomicBool = AtomicBool::new(false);
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Normal as u8);
 
 /// How much the user asked to see.
@@ -88,6 +90,14 @@ pub(crate) fn shown(bytes: &[u8]) {
     }
 }
 
+/// Writes nothing more to stderr, from any thread: for the signal thread on
+/// its way to `exit`, which must get there even when a stderr that nobody
+/// reads has blocked another thread's write (and holds the lock).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn silence() {
+    SILENT.store(true, Ordering::Relaxed);
+}
+
 /// A notice, e.g. "connected" or a status report. Hidden by `-q`.
 pub(crate) fn notice(msg: impl fmt::Display) {
     if level() >= Level::Normal {
@@ -115,14 +125,18 @@ pub(crate) fn verbose(msg: impl fmt::Display) {
 }
 
 fn line(args: fmt::Arguments<'_>) {
+    if SILENT.load(Ordering::Relaxed) {
+        return;
+    }
     let mut stderr = io::stderr().lock();
     // In raw mode the cursor may be anywhere on a line of the port's output:
-    // then start a fresh line first.
+    // then start a fresh line first. Even at the start of a line, a CR: a
+    // bare LF (output processing is off) leaves the cursor in its column.
     let _ = if RAW.load(Ordering::Relaxed) {
         let lead = if MID_LINE.swap(false, Ordering::Relaxed) {
             "\r\n"
         } else {
-            ""
+            "\r"
         };
         write!(stderr, "{lead}{args}\r\n")
     } else {
@@ -148,6 +162,9 @@ struct StderrLines;
 
 impl Write for StderrLines {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if SILENT.load(Ordering::Relaxed) {
+            return Ok(buf.len());
+        }
         let mut stderr = io::stderr().lock();
         if RAW.load(Ordering::Relaxed) {
             for chunk in buf.split_inclusive(|&b| b == b'\n') {

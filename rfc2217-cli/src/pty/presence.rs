@@ -92,13 +92,18 @@ pub(crate) enum Transition {
 
 /// Counts the opens and closes of the device by programs (Linux, inotify).
 ///
-/// The count has one blind spot: inotify merges an event into the previous
-/// one when both are identical and still unread, so two opens within the
-/// same instant (before this thread reads the first) count as one. The
-/// count can then reach zero while one of them still has the device open:
-/// data is dropped until the next open, and that program's exclusive mode or
-/// suspended output is undone. Two closes merged the same way
-/// leave the device counted as open, the same as no detection at all.
+/// inotify merges an event into the one before it when both are identical
+/// and the first is still unread, so two opens (or closes) back to back
+/// would count as one: always for one process that opens the device twice,
+/// or exits with two fds on it. The count would then drift: down to zero
+/// while a program still has the device open (its data dropped, its
+/// exclusive mode undone), or stuck above zero for good. So the directory
+/// (`/dev/pts`) is watched as well: each open and close of the device also
+/// queues an event for the directory, in between, and no two of the
+/// device's events are ever next to each other. The directory's events are
+/// read and dropped; other ptys opening wake the thread for nothing, and a
+/// flood of them can overflow the queue, which ends the count
+/// ([`Transition::Lost`]) without harm.
 ///
 /// Events arrive after the fact, so the flushes are not exact either. A
 /// program that reads at once after opening can read bytes before the flush
@@ -117,6 +122,8 @@ pub(crate) enum Transition {
 #[derive(Debug)]
 pub(crate) struct OpenWatch {
     inotify: OwnedFd,
+    /// The device's watch: the events of every other are dropped.
+    device: i32,
     /// Taken while reading and handling events: the threads that do take
     /// turns, so the events are counted in order.
     count: Mutex<Count>,
@@ -144,10 +151,16 @@ impl OpenWatch {
         let what = format!("watching {} for programs", pty.path().display());
         let inotify = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)
             .map_err(super::sys::failed(&what))?;
-        inotify::add_watch(&inotify, pty.path(), WatchFlags::OPEN | WatchFlags::CLOSE)
-            .map_err(super::sys::failed(&what))?;
+        let events = WatchFlags::OPEN | WatchFlags::CLOSE;
+        let device =
+            inotify::add_watch(&inotify, pty.path(), events).map_err(super::sys::failed(&what))?;
+        // Only so that the device's events are never merged (see above).
+        if let Some(dir) = pty.path().parent() {
+            inotify::add_watch(&inotify, dir, events).map_err(super::sys::failed(&what))?;
+        }
         Ok(Some(Self {
             inotify,
+            device,
             count: Mutex::default(),
             presence: Presence(Arc::new(AtomicU8::new(CLOSED))),
         }))
@@ -223,19 +236,25 @@ impl OpenWatch {
         e
     }
 
-    /// Everything queued, without blocking.
+    /// The device's events queued now, and an overflow, without blocking.
     fn read_events(&self) -> io::Result<Vec<rustix::fs::inotify::ReadFlags>> {
-        use rustix::fs::inotify::Reader;
+        use rustix::fs::inotify::{ReadFlags, Reader};
         use rustix::io::Errno;
         use std::mem::MaybeUninit;
 
-        // Events for a watched file carry no name: 16 bytes each.
-        let mut buf = [MaybeUninit::uninit(); 1024];
+        // The directory's events carry a name of up to 255 bytes.
+        let mut buf = [MaybeUninit::uninit(); 4096];
         let mut reader = Reader::new(&self.inotify, &mut buf);
         let mut events = Vec::new();
         loop {
             match reader.next() {
-                Ok(event) => events.push(event.events()),
+                Ok(event)
+                    if event.wd() == self.device
+                        || event.events().contains(ReadFlags::QUEUE_OVERFLOW) =>
+                {
+                    events.push(event.events());
+                }
+                Ok(_) => {}
                 Err(Errno::AGAIN) => return Ok(events),
                 Err(Errno::INTR) => {}
                 Err(e) => {
@@ -458,6 +477,27 @@ mod tests {
     }
 
     #[test]
+    fn the_last_close_restarts_output_stopped_by_an_xoff() {
+        // With IXON the port's XOFF stops the device's output, and the XON
+        // that would restart it comes for a program that has gone.
+        use rustix::termios::InputModes;
+
+        let (pty, watch) = watched();
+        let killed = Program::open(&pty);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
+        killed.change(|t| t.input_modes |= InputModes::IXON | InputModes::IXOFF);
+        (&pty).write_all(b"\x13").unwrap();
+        drop(killed);
+        assert_eq!(next(&watch, &pty), [Transition::Closed]);
+        let program = Program::open(&pty);
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
+        program.write(b"out");
+        assert_eq!(read_master(&pty, 3), b"out");
+        // The program's settings are as it left them.
+        assert!(program.termios().input_modes.contains(InputModes::IXON));
+    }
+
+    #[test]
     fn a_quick_open_and_close_are_both_seen() {
         let (pty, watch) = watched();
         drop(Program::open(&pty));
@@ -483,43 +523,50 @@ mod tests {
     }
 
     #[test]
-    fn an_overflow_ends_the_count_and_the_queue_still_drains() {
+    fn two_opens_and_two_closes_back_to_back_both_count() {
+        // Without the directory's watch the kernel merges each pair.
         let (pty, watch) = watched();
-        // Each open and close is two events, never merged: past the
-        // kernel's queue limit (fs.inotify.max_queued_events).
-        let limit: usize = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
-            .ok()
-            .and_then(|limit| limit.trim().parse().ok())
-            .unwrap_or(16_384);
-        if limit > 100_000 {
-            eprintln!("skipped: an inotify queue of {limit} events takes too long to fill");
-            return;
-        }
-        for _ in 0..=limit / 2 {
-            drop(Program::open(&pty));
-        }
-        let transitions = watch.update(&pty).unwrap();
-        assert_eq!(
-            transitions.last(),
-            Some(&Transition::Lost),
-            "{transitions:?}"
+        let (first, second) = (Program::open(&pty), Program::open(&pty));
+        assert_eq!(next(&watch, &pty), [Transition::Opened]);
+        assert_eq!(watch.opens(), 2);
+        drop(second);
+        quiet(&watch, &pty);
+        assert!(watch.presence().is_open());
+        let third = Program::open(&pty);
+        drop((first, third));
+        assert_eq!(next(&watch, &pty), [Transition::Closed]);
+        assert_eq!(watch.opens(), 0);
+    }
+
+    #[test]
+    fn an_overflow_ends_the_count_and_the_queue_still_drains() {
+        use rustix::fs::inotify::ReadFlags;
+
+        // Filling the kernel's queue for real would overflow the watches of
+        // the tests running beside this one: they see its ptys' directory
+        // events.
+        let (pty, watch) = watched();
+        let mut transitions = Vec::new();
+        watch.handle(
+            &mut watch.lock(),
+            ReadFlags::QUEUE_OVERFLOW,
+            &pty,
+            &mut transitions,
         );
+        assert_eq!(transitions, [Transition::Lost]);
         assert_eq!(watch.presence().get(), None);
         assert!(watch.presence().is_open());
         // Later events are still read, or `wait` would never wait again.
         drop(Program::open(&pty));
         assert_eq!(watch.update(&pty).unwrap(), []);
-        let start = Instant::now();
-        assert_eq!(watch.wait(&pty, Some(SHORT)).unwrap(), []);
-        assert!(start.elapsed() >= SHORT);
+        assert_eq!(watch.read_events().unwrap(), []);
     }
 
     #[test]
     fn wait_times_out() {
+        // Without the time it took: other tests' ptys wake it early.
         let (pty, watch) = watched();
-        let start = Instant::now();
         assert_eq!(watch.wait(&pty, Some(SHORT)).unwrap(), []);
-        assert!(start.elapsed() >= SHORT);
         assert_eq!(watch.wait(&pty, Some(Duration::ZERO)).unwrap(), []);
     }
 }

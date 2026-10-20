@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::io;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Ipv6Addr, TcpStream, ToSocketAddrs};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -33,7 +33,17 @@ impl FromStr for Target {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        let rest = s.strip_prefix("rfc2217://").unwrap_or(s);
+        let rest = match s.split_once("://") {
+            // URL schemes are case-insensitive (pyserial writes them in
+            // lower case).
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("rfc2217") => rest,
+            Some((scheme, _)) => {
+                return Err(format!(
+                    "`{scheme}://` is not supported: give host:port or rfc2217://host:port"
+                ));
+            }
+            None => s,
+        };
         if let Some((_, options)) = rest.split_once('?') {
             return Err(format!("URL options (`?{options}`) are not supported"));
         }
@@ -53,8 +63,18 @@ impl FromStr for Target {
             };
             return Self::new(host, port);
         }
-        // A bare IPv6 address has two or more colons and no port.
+        // A bare IPv6 address has two or more colons and no port; anything
+        // else with that many is a mistake, not an address to look up.
         if rest.matches(':').count() > 1 {
+            let address = rest
+                .split_once('%')
+                .map_or(rest, |(address, _zone)| address);
+            if address.parse::<Ipv6Addr>().is_err() {
+                return Err(format!(
+                    "`{rest}` is not an IPv6 address; with a port, put the address in brackets: \
+                     [address]:port"
+                ));
+            }
             return Self::new(rest, DEFAULT_PORT);
         }
         match rest.rsplit_once(':') {
@@ -145,6 +165,8 @@ mod tests {
         assert_eq!(target("[::1]"), ("::1".into(), 2217));
         assert_eq!(target("fe80::1"), ("fe80::1".into(), 2217));
         assert_eq!(target("rfc2217://bridge:4001/"), ("bridge".into(), 4001));
+        assert_eq!(target("RFC2217://bridge:4001"), ("bridge".into(), 4001));
+        assert_eq!(target("fe80::1%eth0"), ("fe80::1%eth0".into(), 2217));
     }
 
     #[test]
@@ -158,6 +180,10 @@ mod tests {
             "[::1",
             "[::1]x",
             "rfc2217://h?logging=debug",
+            "telnet://bridge:23",
+            "socket://bridge:4001",
+            "bridge::4001",
+            "fe80::1:4001:x",
         ] {
             assert!(s.parse::<Target>().is_err(), "{s}");
         }

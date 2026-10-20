@@ -20,15 +20,24 @@ use crate::ui;
 pub(crate) fn run(args: ConnectArgs) -> Exit {
     let interactive = io::stdin().is_terminal();
     // Windows consoles strip Ctrl-Z from reads and reject output that is
-    // not UTF-8 (finding cn-6): a terminal session needs its own console
-    // code there.
+    // not UTF-8 (finding cn-6): a terminal session, and the port's output
+    // on a console, need console code of their own there.
     #[cfg(not(unix))]
-    if interactive {
-        ui::error(
-            "interactive sessions are not supported on Windows yet; pipe the input in instead \
-             (e.g. `type commands.txt | rfc2217 connect HOST`)",
-        );
-        return Exit::Usage;
+    {
+        let what = if interactive {
+            "interactive sessions are not supported on Windows yet"
+        } else if io::stdout().is_terminal() {
+            "on Windows, the port's output cannot go to the console yet"
+        } else {
+            ""
+        };
+        if !what.is_empty() {
+            ui::error(format_args!(
+                "{what}; pipe the input in and redirect the output \
+                 (e.g. `type commands.txt | rfc2217 connect HOST > reply.txt`)"
+            ));
+            return Exit::Usage;
+        }
     }
     let stream = match args.target.connect() {
         Ok(stream) => stream,
@@ -101,6 +110,9 @@ mod terminal {
     /// times the BREAK-OFF itself (finding cn-9).
     const BREAK: Duration = Duration::from_millis(250);
 
+    /// How long `z` waits for what was typed before it to be written.
+    const SUSPEND_DRAIN: Duration = Duration::from_secs(1);
+
     /// The rates `u` and `n` step through.
     const RATES: [u32; 13] = [
         300, 600, 1200, 2400, 4800, 9600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800,
@@ -135,6 +147,7 @@ mod terminal {
             dtr: setup.args.dtr.map(OnOff::is_on),
             rts: setup.args.rts.map(OnOff::is_on),
             break_off: None,
+            suspend: None,
         };
         let io = LocalIo {
             reader: Box::new(io::stdin()),
@@ -165,6 +178,9 @@ mod terminal {
         rts: Option<bool>,
         /// When the BREAK that `b` started ends.
         break_off: Option<Instant>,
+        /// When `z` was typed: the session stops once a BREAK in progress
+        /// has ended and the commands typed before have gone out.
+        suspend: Option<Instant>,
     }
 
     impl Local for Terminal {
@@ -234,18 +250,31 @@ mod terminal {
         }
 
         fn next_tick(&self) -> Option<Instant> {
-            self.break_off
+            self.break_off.or(self.suspend)
         }
 
         fn tick(&mut self, now: Instant, ctl: &mut Ctl) -> Option<Exit> {
             if self.break_off.is_some_and(|at| at <= now) {
                 self.end_break(ctl);
             }
+            if self.break_off.is_none() && self.suspend.take().is_some() {
+                // Every thread stops with the process: what was typed before
+                // `z`, and the BREAK-OFF, must be written first.
+                ctl.wait_sent(SUSPEND_DRAIN);
+                return self.suspend();
+            }
             None
         }
 
         fn remote_closed(&self) -> Exit {
             Exit::Ok
+        }
+
+        /// Never leave the remote line in BREAK, however the session ends.
+        fn ending(&mut self, ctl: &mut Ctl) {
+            if self.break_off.is_some() {
+                self.end_break(ctl);
+            }
         }
     }
 
@@ -261,17 +290,14 @@ mod terminal {
         fn command(&mut self, key: u8, ctl: &mut Ctl) -> Option<Exit> {
             match key {
                 b'q' | b'.' => {
-                    // Never leave the remote line in BREAK.
-                    if self.break_off.is_some() {
-                        self.end_break(ctl);
-                    }
+                    // `ending` ends a BREAK in progress.
                     ui::notice("closing the connection");
                     return Some(Exit::Ok);
                 }
                 b'b' => self.start_break(ctl),
                 b'd' => {
                     let on = !self.dtr.unwrap_or(true);
-                    if usable(ctl.client(), "DTR") {
+                    if usable(ctl, "DTR") {
                         ctl.client().set_dtr(on);
                         self.dtr = Some(on);
                         ui::notice(format_args!("DTR {}", on_off(on)));
@@ -279,14 +305,14 @@ mod terminal {
                 }
                 b'r' => {
                     let on = !self.rts.unwrap_or(true);
-                    if usable(ctl.client(), "RTS") {
+                    if usable(ctl, "RTS") {
                         ctl.client().set_rts(on);
                         self.rts = Some(on);
                         ui::notice(format_args!("RTS {}", on_off(on)));
                     }
                 }
                 b'p' => {
-                    if usable(ctl.client(), "purge") {
+                    if usable(ctl, "purge") {
                         ctl.client().purge(Purge::Both);
                         ui::notice("asked the bridge to purge both buffers");
                     }
@@ -298,7 +324,7 @@ mod terminal {
                     self.echo = !self.echo;
                     ui::notice(format_args!("local echo {}", on_off(self.echo)));
                 }
-                b'z' => return self.suspend(),
+                b'z' => self.suspend = Some(Instant::now()),
                 b'?' | b'h' => ui::notice(help(self.escape_name())),
                 _ => ui::notice(format_args!(
                     "{} is not a command key ({} ? for help)",
@@ -316,12 +342,7 @@ mod terminal {
         fn start_break(&mut self, ctl: &mut Ctl) {
             if self.break_off.is_some() {
                 ui::notice("a BREAK is in progress already");
-            } else if ctl.client().com_port_state() == ComPortState::Negotiating {
-                // The alloc layer would hold the BREAK-ON and the BREAK-OFF
-                // timed here, and write them back to back once the bridge
-                // answers: a BREAK of no length.
-                ui::notice("no BREAK yet: the bridge has not answered the RFC 2217 offer");
-            } else if usable(ctl.client(), "BREAK") {
+            } else if usable(ctl, "BREAK") {
                 ctl.client().set_break(true);
                 self.break_off = Some(Instant::now() + BREAK);
                 ui::notice(format_args!("BREAK for {} ms", BREAK.as_millis()));
@@ -353,12 +374,21 @@ mod terminal {
         }
     }
 
-    /// Whether a command can reach the bridge: not while it refuses RFC 2217
-    /// (the alloc layer would drop the command silently, finding cn-9).
-    /// While negotiating, the alloc layer holds it and sends it after the
-    /// settings.
-    fn usable(client: &Client, what: &str) -> bool {
-        let refused = client.com_port_state() == ComPortState::Refused;
+    /// Whether a command can reach the bridge, in order with the data typed
+    /// before it: not before the negotiation has settled, while that data is
+    /// held (the alloc layer would send the command as soon as the bridge
+    /// takes up RFC 2217, ahead of it; and it would hold a BREAK-ON and the
+    /// BREAK-OFF timed here, and send them back to back: a BREAK of no
+    /// length), and not while the bridge refuses RFC 2217 (the alloc layer
+    /// would drop the command silently, finding cn-9).
+    fn usable(ctl: &mut Ctl, what: &str) -> bool {
+        if !ctl.settled() {
+            ui::notice(format_args!(
+                "no {what} yet: the bridge has not answered the settings"
+            ));
+            return false;
+        }
+        let refused = ctl.client().com_port_state() == ComPortState::Refused;
         if refused {
             ui::notice(format_args!("no {what}: the bridge does not do RFC 2217"));
         }
@@ -374,10 +404,10 @@ mod terminal {
     /// `u` and `n`: the next standard rate above or below the current one,
     /// which is the requested rate, or the reported one for `keep`.
     fn step_baud(ctl: &mut Ctl, step: Step) {
-        let client = ctl.client();
-        if !usable(client, "baud rate change") {
+        if !usable(ctl, "baud rate change") {
             return;
         }
+        let client = ctl.client();
         let mut settings = client.requested_settings();
         let current = match settings.baud_rate {
             0 => client.reported_settings().baud_rate,
@@ -388,11 +418,7 @@ mod terminal {
             return;
         };
         let Some(next) = next_rate(current, step) else {
-            let end = if step == Step::Up {
-                "highest"
-            } else {
-                "lowest"
-            };
+            let end = if step == Step::Up { "higher" } else { "lower" };
             ui::notice(format_args!(
                 "{current} baud: there is no standard rate {end} than that"
             ));
