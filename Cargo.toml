@@ -11,7 +11,7 @@ authors = ["Greg Echelberger <gechelberger@gmail.com>"]
 repository = "https://github.com/gechelberger/rfc2217"
 # CI only: the workflow and the firmware stub it links. `examples/` stays in
 # the package (the `Server` docs link to its docs.rs source view).
-exclude = ["/.github", "/ci"]
+exclude = ["/.github", "/ci", "/justfile"]
 
 [features]
 default = ["alloc"]
