@@ -15,7 +15,7 @@ default:
 # Format check, clippy and tests for both crates.
 check: lint test cli-lint cli-test
 
-# Everything CI checks, for both crates. Needs the 1.85 and nightly toolchains and the targets of `no-std` and `cli-cross`.
+# Everything CI checks, for both crates. Needs the 1.85 and nightly toolchains and the targets of `cli-cross`.
 ci: lint docs docs-rs test msrv no-std minimal-versions package cli-lint cli-cross cli-test cli-msrv cli-package
 
 # Format both crates and the firmware stub.
@@ -58,9 +58,10 @@ docs:
 docs-rs:
     RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --no-deps --all-features
 
-# A microcontroller build, and a firmware stub that must link without an allocator. Needs `rustup target add thumbv6m-none-eabi`.
+# A microcontroller build, and a firmware stub that must link without an allocator.
 [group('library')]
 no-std:
+    rustup target add thumbv6m-none-eabi
     cargo build --lib --target thumbv6m-none-eabi --no-default-features
     cargo build --lib --target thumbv6m-none-eabi
     cargo build --release --target thumbv6m-none-eabi --manifest-path ci/fw-stub/Cargo.toml
