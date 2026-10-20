@@ -1,0 +1,46 @@
+[package]
+name = "rfc2217"
+description = "Sans-IO RFC 2217 (Telnet COM Port Control) client and server state machines for serial-over-TCP bridges such as ser2net"
+keywords = ["rfc2217", "telnet", "serial", "sans-io", "ser2net"]
+categories = ["network-programming", "hardware-support", "embedded", "no-std", "no-std::no-alloc"]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Greg Echelberger <gechelberger@gmail.com>"]
+repository = "https://github.com/gechelberger/rfc2217"
+# CI only: the workflow and the firmware stub it links. `examples/` stays in
+# the package (the `Server` docs link to its docs.rs source view).
+exclude = ["/.github", "/ci"]
+
+[features]
+default = ["alloc"]
+# The alloc layer: `Vec`-based convenience methods (`receive`, `take_output`,
+# `write_data`, infallible commands). Adds methods only; the core API is the
+# same without it. The final binary then needs a global allocator.
+alloc = []
+# Debug logs through `tracing`. Off by default: the default build has no
+# dependencies. Needs a target with atomic compare-and-swap.
+tracing = ["dep:tracing"]
+
+[dependencies]
+tracing = { version = "0.1.40", default-features = false, optional = true }
+
+# Uses the alloc layer; `core_client` and `sim_server` build without it.
+[[example]]
+name = "blocking_client"
+required-features = ["alloc"]
+
+[lints.rust]
+# `lib.rs` forbids unsafe code; `deny` here lets a test file allow it locally.
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

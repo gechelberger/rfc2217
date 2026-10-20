@@ -1,0 +1,20 @@
+# A firmware-shaped binary that CI links for thumbv6m-none-eabi: `no_std`,
+# `no_main`, no global allocator, rfc2217 without default features. It links
+# only if the core never needs the `alloc` crate. Not part of the package.
+[package]
+name = "fw-stub"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace: it is not a member of rfc2217's.
+[workspace]
+
+[dependencies]
+rfc2217 = { path = "../..", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
