@@ -20,6 +20,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub(crate) const LOG: &str = "rfc2217_cli";
 
 static RAW: AtomicBool = AtomicBool::new(false);
+/// In raw mode: the terminal's cursor is not at the start of a line.
+static MID_LINE: AtomicBool = AtomicBool::new(false);
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Normal as u8);
 
 /// How much the user asked to see.
@@ -75,6 +77,17 @@ pub(crate) fn set_raw(on: bool) {
     RAW.store(on, Ordering::Relaxed);
 }
 
+/// In raw mode, the terminal shows `bytes` (the port's output, or the local
+/// echo): the next message starts on a line of its own unless they ended
+/// one. A CR alone is not enough: the message would overwrite the line.
+// Only Unix has a raw mode (see term.rs).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn shown(bytes: &[u8]) {
+    if let Some(&last) = bytes.last() {
+        MID_LINE.store(last != b'\n', Ordering::Relaxed);
+    }
+}
+
 /// A notice, e.g. "connected" or a status report. Hidden by `-q`.
 pub(crate) fn notice(msg: impl fmt::Display) {
     if level() >= Level::Normal {
@@ -104,9 +117,14 @@ pub(crate) fn verbose(msg: impl fmt::Display) {
 fn line(args: fmt::Arguments<'_>) {
     let mut stderr = io::stderr().lock();
     // In raw mode the cursor may be anywhere on a line of the port's output:
-    // start a fresh line first.
+    // then start a fresh line first.
     let _ = if RAW.load(Ordering::Relaxed) {
-        write!(stderr, "\r\n{args}\r\n")
+        let lead = if MID_LINE.swap(false, Ordering::Relaxed) {
+            "\r\n"
+        } else {
+            ""
+        };
+        write!(stderr, "{lead}{args}\r\n")
     } else {
         writeln!(stderr, "{args}")
     };

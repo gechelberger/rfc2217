@@ -209,6 +209,7 @@ mod terminal {
         }
 
         fn output(&mut self, payload: Vec<u8>) -> Vec<u8> {
+            ui::shown(&payload);
             if !self.lf_crlf {
                 return payload;
             }
@@ -250,6 +251,7 @@ mod terminal {
 
     impl Terminal {
         fn forward(&mut self, data: &mut Vec<u8>, echo: &mut Vec<u8>, ctl: &mut Ctl) {
+            ui::shown(echo);
             ctl.show(mem::take(echo));
             ctl.send(data);
             data.clear();
