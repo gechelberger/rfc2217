@@ -13,7 +13,7 @@ listed. The library has its own changelog.
 
 ## [Unreleased]
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-20
 
 The first release, built on rfc2217 0.1.
 
@@ -76,7 +76,8 @@ The first release, built on rfc2217 0.1.
 - `pty`: data bits and parity come from the command line only (on Linux the
   pty driver forces 8 data bits and no parity); a pty has no DTR, RTS, BREAK
   or modem lines, so tools that reset a board through them do not work; it is
-  not paced by the baud rate. On macOS it has not run on a Mac yet.
+  not paced by the baud rate. On macOS only the automated tests have run it
+  (on GitHub's macOS runners).
 - Windows: `connect` with piped or redirected input and output only, and no
   `pty`.
 - No `serve` (sharing a local serial port) and no reconnecting yet.

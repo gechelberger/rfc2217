@@ -10,9 +10,6 @@ license = "MIT OR Apache-2.0"
 authors = ["Greg Echelberger <gechelberger@gmail.com>"]
 repository = "https://github.com/gechelberger/rfc2217"
 readme = "README.md"
-# Not on crates.io yet: the first release is published by hand (see
-# CHANGELOG.md), after which release-cli.yml takes over.
-publish = false
 
 # Its own workspace, like ci/fw-stub: it is not a member of rfc2217's, so the
 # library's lockfile, feature unification and CI never see the CLI.
