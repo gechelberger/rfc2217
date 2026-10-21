@@ -1,0 +1,295 @@
+# Release for rfc2217-cli: pushing a rfc2217-cli-vX.Y.Z tag publishes the
+# command-line crate in rfc2217-cli/ to crates.io and creates its GitHub
+# release. The library is released by release.yml, from v* tags.
+#
+#   verify          tag == "rfc2217-cli-v" + the rfc2217-cli/Cargo.toml version,
+#                   the tagged commit is on main, rfc2217-cli/Cargo.lock is
+#                   current, rfc2217-cli/CHANGELOG.md has a dated section for
+#                   the version (its body becomes the notes), and
+#                   `cargo publish --dry-run` builds the package against the
+#                   library as published on crates.io
+#   ci              every ci-cli.yml job, on the tagged commit
+#   publish         crates.io trusted publishing (a short-lived OIDC-based
+#                   token; no API token secret), in the `release-cli`
+#                   environment. It builds nothing: see the comment on the job.
+#   github-release  creates the GitHub release, or updates it on a re-run. A
+#                   CLI release never becomes the repository's 'Latest'
+#                   release; that stays with the library.
+#
+# Why a file and an environment of their own, not a second tag pattern in
+# release.yml: crates.io matches a trusted publisher on the repository, the
+# workflow file and the environment, and the token it hands out is valid for
+# every crate whose trusted publisher matches all three. With one file and
+# one environment, every library release could also publish the CLI, and the
+# reverse. Apart, each run's token covers its own crate only, the CLI has its
+# own reviewer and tag policy, and neither crate's release waits on the other's
+# CI.
+#
+# crates.io trusts this file by its name (release-cli.yml) and the
+# `release-cli` environment. Renaming either breaks publishing until the
+# rfc2217-cli trusted publisher (crate Settings > Trusted Publishing) is
+# changed to match.
+#
+# One-time setup, in this order. Trusted publishing cannot create a crate, so
+# the first version is published by hand:
+#   1. Merge the release commit to main: rfc2217-cli/Cargo.toml without
+#      `publish = false`, and a dated "## [0.1.0] - YYYY-MM-DD" section in
+#      rfc2217-cli/CHANGELOG.md. ci-cli.yml must pass on it.
+#   2. From a clean checkout of exactly that commit, publish with a crates.io
+#      API token that has only the publish-new scope (in CARGO_REGISTRY_TOKEN,
+#      not saved with `cargo login`), then revoke the token:
+#        cargo publish --locked --manifest-path rfc2217-cli/Cargo.toml
+#   3. In the repository's Settings > Environments, create `release-cli` with a
+#      required reviewer and deployment tags limited to rfc2217-cli-v*. It must
+#      exist before the tag is pushed: the publish job names the environment
+#      even when it skips the upload, and a ref the environment does not allow
+#      cannot run that job (nor github-release after it).
+#   4. On crates.io, rfc2217-cli > Settings > Trusted Publishing: add a GitHub
+#      publisher with owner gechelberger, repository rfc2217, workflow
+#      release-cli.yml and environment release-cli.
+#   5. Push the rfc2217-cli-v0.1.0 tag on that commit. The publish job finds
+#      0.1.0 on crates.io from the same commit and skips the upload, and
+#      github-release creates the release.
+#
+# Each later release: one commit on main that sets the version in
+# rfc2217-cli/Cargo.toml, updates rfc2217-cli/Cargo.lock to match (any cargo
+# command there does) and dates the CHANGELOG section; then the
+# rfc2217-cli-vX.Y.Z tag on that commit. To see the notes first:
+#   bash .github/scripts/release-notes.sh X.Y.Z rfc2217-cli/CHANGELOG.md HEAD rfc2217-cli-vX.Y.Z
+#
+# The published CLI depends on rfc2217 from crates.io, and verify builds it
+# that way. When the CLI starts to use library API or features that are not
+# released, or a new incompatible library version, release the library first
+# and push the CLI tag once that version is on crates.io (a verify that failed
+# for want of it passes on a re-run).
+#
+# Re-runs are safe: a version already on crates.io from this commit is not
+# published again, and an existing release is updated instead of duplicated.
+name: Release rfc2217-cli
+
+on:
+  push:
+    tags:
+      - "rfc2217-cli-v*"
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # Explicit bash runs steps with `-eo pipefail`.
+    shell: bash
+
+jobs:
+  verify:
+    name: Check tag, version and changelog
+    # A fork that enables Actions and pushes a rfc2217-cli-v* tag skips the
+    # whole run.
+    if: github.repository == 'gechelberger/rfc2217'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # actions/checkout
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # All branches and tags, to check that the tag is on main.
+          fetch-depth: 0
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Tag matches rfc2217-cli/Cargo.toml and is on main
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # --locked (with dependency resolution) also fails when a version
+          # bump was committed without the matching Cargo.lock change. The
+          # library appears too, as a path dependency: select by name.
+          version=$(cargo metadata --manifest-path rfc2217-cli/Cargo.toml --format-version 1 --locked |
+            jq -r '.packages[] | select(.name == "rfc2217-cli" and .source == null) | .version')
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::unexpected rfc2217-cli/Cargo.toml version '$version'"
+            exit 1
+          fi
+          if [ "$TAG" != "rfc2217-cli-v$version" ]; then
+            echo "::error::tag $TAG does not match the rfc2217-cli/Cargo.toml version $version (expected rfc2217-cli-v$version)"
+            exit 1
+          fi
+          head=$(git rev-parse HEAD)
+          if [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$head" ]; then
+            echo "::error::the checkout is not the commit tagged $TAG (was the tag moved?)"
+            exit 1
+          fi
+          # Releases come from main only, as in release.yml.
+          if ! git merge-base --is-ancestor "$head" refs/remotes/origin/main; then
+            echo "::error::$TAG ($head) is not on main"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Release notes from rfc2217-cli/CHANGELOG.md
+        id: notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # TAG makes the script require the changelog's link reference to end
+          # in /rfc2217-cli-vX.Y.Z or .rfc2217-cli-vX.Y.Z, not the library's vX.Y.Z.
+          bash .github/scripts/release-notes.sh "$VERSION" rfc2217-cli/CHANGELOG.md HEAD "$TAG" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          # One line of base64: no heredoc delimiter can collide with the notes.
+          echo "notes=$(base64 -w0 "$RUNNER_TEMP/notes.md")" >> "$GITHUB_OUTPUT"
+      # The publish build happens here, in a job that cannot get an OIDC token,
+      # because build scripts and proc-macros run during it (see `publish`).
+      # The package takes rfc2217 from crates.io, so this fails while the CLI
+      # needs a library release that is not there yet. A version already on
+      # crates.io only warns, so re-runs still pass.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --locked --manifest-path rfc2217-cli/Cargo.toml
+
+  ci:
+    name: CI
+    needs: verify
+    # The same checks as pushes and pull requests. A same-repository reusable
+    # workflow runs from the caller's commit, so this tests the tagged commit.
+    # zizmor's self-repository audit prefers `$/`; `./` resolves to the same
+    # commit for a reusable workflow, and actionlint does not accept `$/` yet.
+    uses: ./.github/workflows/ci-cli.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read # actions/checkout in every ci-cli.yml job
+
+  publish:
+    name: Publish to crates.io
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # crates.io checks the OIDC token's repository, workflow file
+    # (release-cli.yml) and environment (release-cli), but not the ref. So the
+    # `release-cli` environment is what stops any other run of this file from
+    # publishing:
+    # - its required reviewer, which GitHub enforces for every job that names
+    #   the environment, `deployment: false` included;
+    # - its tag policy (rfc2217-cli-v* only), which adds a second gate.
+    # Approve only runs whose ref is the rfc2217-cli-vX.Y.Z tag being released.
+    environment:
+      name: release-cli
+      url: https://crates.io/crates/rfc2217-cli/${{ needs.verify.outputs.version }}
+    # One CLI publish at a time; never cancel one that has started. The group
+    # is not release.yml's, so a library publish never displaces a pending CLI
+    # publish or the reverse.
+    concurrency:
+      group: crates-io-publish-rfc2217-cli
+      cancel-in-progress: false
+    # id-token: write applies to the whole job, not to one step. Every step,
+    # and every process a step starts, gets ACTIONS_ID_TOKEN_REQUEST_URL and
+    # ACTIONS_ID_TOKEN_REQUEST_TOKEN, so it can fetch an OIDC token and trade
+    # it for a crates.io token of its own. So nothing in this job compiles:
+    # no build script or proc-macro ever runs here. The build is done by
+    # `verify` (cargo publish --dry-run) and by CI.
+    permissions:
+      contents: read # actions/checkout
+      id-token: write # the OIDC token that crates-io-auth-action exchanges
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      # A re-run after a later job failed, or the tag run after the first
+      # version was published by hand from this commit, must not publish
+      # again. A version that is on crates.io from another commit stops the
+      # release instead.
+      - name: Is this version already on crates.io?
+        id: crates-io
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          name=rfc2217-cli
+          ua='rfc2217-cli release workflow (https://github.com/gechelberger/rfc2217)'
+          status=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' -A "$ua" \
+            "https://crates.io/api/v1/crates/$name/$VERSION")
+          case $status in
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            200)
+              crate="$name-$VERSION"
+              curl -fsSL --retry 3 -A "$ua" -o "$RUNNER_TEMP/$crate.crate" \
+                "https://static.crates.io/crates/$name/$crate.crate"
+              if ! vcs=$(tar -xzOf "$RUNNER_TEMP/$crate.crate" "$crate/.cargo_vcs_info.json"); then
+                echo "::error::$name $VERSION is on crates.io without .cargo_vcs_info.json; cannot tell which commit it came from"
+                exit 1
+              fi
+              published=$(jq -r '.git.sha1 // empty' <<< "$vcs")
+              head=$(git rev-parse HEAD)
+              if [ "$published" != "$head" ]; then
+                echo "::error::$name $VERSION is already on crates.io from commit ${published:-unknown}, but $GITHUB_REF_NAME is $head"
+                exit 1
+              fi
+              if [ "$(jq -r '.git.dirty // false' <<< "$vcs")" = true ]; then
+                echo "::warning::$name $VERSION was published from $head with uncommitted changes"
+              fi
+              echo "$name $VERSION is already on crates.io from $head: skipping the publish"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io answered HTTP $status for $name $VERSION"
+              exit 1
+              ;;
+          esac
+      # Exchanges the job's OIDC token for a crates.io token that expires after
+      # 30 minutes; the action's post step revokes it when the job ends. Before
+      # the first version is on crates.io there is no trusted publisher to
+      # match, and this fails (see the one-time setup above).
+      - name: crates.io token (trusted publishing)
+        id: auth
+        if: steps.crates-io.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: cargo publish
+        if: steps.crates-io.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        # --no-verify packages the crate and uploads it without building it,
+        # so no build script or proc-macro runs in this job. `verify` built
+        # the same commit with `cargo publish --dry-run --locked`.
+        run: cargo publish --locked --no-verify --manifest-path rfc2217-cli/Cargo.toml
+
+  github-release:
+    name: GitHub release
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # gh release create / edit
+    steps:
+      # No checkout and no third-party code in the only job that can write.
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          NOTES: ${{ needs.verify.outputs.notes }}
+        run: |
+          printf '%s' "$NOTES" | base64 -d > "$RUNNER_TEMP/notes.md"
+          title="rfc2217-cli $VERSION"
+          prerelease=false
+          if [[ $VERSION == *-* ]]; then prerelease=true; fi
+          # --latest=false on both paths: the repository's 'Latest' release is
+          # the library's, and a draft published through `edit` could
+          # otherwise take it.
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # A re-run, or a release made by hand: bring title and notes in line.
+            # `release view` also finds a draft for the tag; --draft=false
+            # publishes it (edit leaves the draft flag alone otherwise).
+            gh release edit "$TAG" --title "$title" --notes-file "$RUNNER_TEMP/notes.md" \
+              --prerelease="$prerelease" --draft=false --latest=false
+          else
+            # --verify-tag: release the pushed tag; never create one.
+            gh release create "$TAG" --verify-tag --title "$title" \
+              --notes-file "$RUNNER_TEMP/notes.md" --prerelease="$prerelease" --latest=false
+          fi

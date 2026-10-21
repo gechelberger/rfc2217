@@ -1,0 +1,172 @@
+# Checks for rfc2217-cli, the command-line crate in rfc2217-cli/: tests on
+# Linux, macOS and Windows, the MSRV, lints, and the package as crates.io users
+# get it. It is a workflow of its own so that library releases (release.yml
+# runs ci.yml) never wait on CLI jobs; release-cli.yml runs this one instead.
+#
+# Each check job runs one recipe of the justfile at the repository root
+# (`just cli-test` and so on), so the same commands run locally. The jobs add
+# the toolchains, `just` itself and the OS matrix; the package job keeps its
+# commands here, since its checks report through GitHub annotations and
+# depend on the ref.
+#
+# It runs on every push, not only on changes under rfc2217-cli/: the CLI builds
+# against the library in this checkout (a path dependency), so a library change
+# can break it.
+#
+# rfc2217-cli is a workspace of its own, with its own Cargo.lock, which records
+# the library's version. A commit that changes the library's version must also
+# update that lockfile (`cargo update -p rfc2217 --manifest-path
+# rfc2217-cli/Cargo.toml`), or every --locked command here fails. A
+# semver-incompatible version (0.1.x to 0.2.0) must also raise the `rfc2217`
+# requirement in rfc2217-cli/Cargo.toml in the same commit, or the CLI does not
+# resolve at all.
+name: CI rfc2217-cli
+
+on:
+  push:
+  pull_request:
+  # release-cli.yml runs every job here on the tagged commit before publishing.
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # Explicit bash runs steps with `-eo pipefail`, on Windows too (Git Bash).
+    # `just` runs its recipe lines with `sh`, which Git Bash also provides.
+    shell: bash
+
+jobs:
+  test:
+    strategy:
+      # A failure on one OS says nothing about the others: let them finish.
+      fail-fast: false
+      matrix:
+        # A native build on each OS compiles the code that is cfg-gated to it
+        # (unix, target_os = "macos", windows), so no cross-target
+        # `cargo check` is needed.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - run: just cli-test
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
+      - run: rustup toolchain install 1.85 --profile minimal --no-self-update
+      # Edition 2024 implies resolver 3, which picks dependency versions whose
+      # rust-version is at most 1.85. If a newer cargo rewrote Cargo.lock in a
+      # format 1.85 cannot read, regenerate it with `cargo +1.85 generate-lockfile
+      # --manifest-path rfc2217-cli/Cargo.toml`.
+      - run: just cli-msrv
+
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Clippy on each OS: code behind cfg(unix) or cfg(windows) is linted
+        # only where it compiles, and `cargo test` passes despite warnings.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update && rustup default stable
+      # Formatting is the same everywhere: once is enough, so the Linux job
+      # runs `cli-lint` (clippy and the format check), the others clippy only.
+      - if: runner.os == 'Linux'
+        run: just cli-lint
+      - if: runner.os != 'Linux'
+        run: just cli-clippy
+
+  # What `cargo install --locked rfc2217-cli` gets. These commands work with
+  # and without `publish = false` in Cargo.toml.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: rfc2217-cli
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      # crates.io rejects an upload without them, but `cargo package` and
+      # `cargo publish --dry-run` only warn.
+      - name: manifest has a description and a licence
+        run: |
+          cargo metadata --format-version 1 --no-deps |
+            jq -e '.packages[] | select(.name == "rfc2217-cli") |
+              (.description // "") != "" and ((.license // "") != "" or (.license_file // "") != "")'
+      - name: package has the licences, README, changelog and lockfile, and no build output
+        run: |
+          list="$(cargo package --list --locked)"
+          printf '%s\n' "$list"
+          missing=""
+          for file in Cargo.lock CHANGELOG.md LICENSE-APACHE LICENSE-MIT README.md; do
+            grep -qxF "$file" <<< "$list" || missing="$missing $file"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::the package lacks$missing"
+            exit 1
+          fi
+          if grep -E '^target/' <<< "$list"; then
+            echo "::error::the package contains target/ entries"
+            exit 1
+          fi
+      # `cargo package` builds the .crate as crates.io users get it: its
+      # Cargo.lock takes rfc2217 from crates.io, not from this checkout, so it
+      # fails while the CLI uses library API, features or a library version
+      # that is not on crates.io yet. Between a library change and its release
+      # that is expected, so on branches and pull requests it only warns. On a
+      # rfc2217-cli-v* tag (the CLI release) it fails the run; release-cli.yml's
+      # verify job checks the same with `cargo publish --dry-run`.
+      - name: package builds against rfc2217 from crates.io
+        run: |
+          if cargo package --locked; then
+            exit 0
+          fi
+          if [[ $GITHUB_REF == refs/tags/rfc2217-cli-v* ]]; then
+            echo "::error::the packaged rfc2217-cli does not build against rfc2217 from crates.io"
+            exit 1
+          fi
+          echo "::warning::the packaged rfc2217-cli does not build against rfc2217 from crates.io; release the library before the CLI (see the log above)"

@@ -1,6 +1,11 @@
 # Release checks for rfc2217: tests on stable and the MSRV, lints, docs, the
 # no_std builds (including a firmware stub that must link without a global
 # allocator), minimal dependency versions and packaging.
+#
+# Each check job runs one recipe of the justfile at the repository root, so
+# `just <recipe>` runs the same commands locally. The jobs add the toolchains
+# and `just` itself; the package job keeps its commands here, since its file
+# check reports through GitHub annotations.
 name: CI
 
 on:
@@ -27,10 +32,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
-      - run: cargo test
-      - run: cargo test --all-features
-      - run: cargo test --no-default-features
+      - run: just test
 
   msrv:
     runs-on: ubuntu-latest
@@ -38,13 +47,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
       - run: rustup toolchain install 1.85 --profile minimal --no-self-update
       # Edition 2024 implies resolver 3, which picks dependency versions whose
       # rust-version is at most 1.85. If a newer cargo rewrote Cargo.lock in a
       # format 1.85 cannot read, regenerate it with `cargo +1.85 generate-lockfile`.
-      - run: cargo +1.85 test
-      - run: cargo +1.85 test --all-features
-      - run: cargo +1.85 test --no-default-features
+      - run: just msrv
 
   lint:
     runs-on: ubuntu-latest
@@ -52,38 +65,50 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update && rustup default stable
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings
-      - run: cargo fmt --check
-      # The firmware stub is a workspace of its own: the root checks skip it.
-      - run: cargo fmt --check --manifest-path ci/fw-stub/Cargo.toml
+      # Also the format check of the firmware stub, a workspace of its own
+      # that the root checks skip.
+      - run: just lint
 
   docs:
     runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
-      - run: cargo doc --no-deps --all-features
-      - run: cargo doc --no-deps --no-default-features
+      # With RUSTDOCFLAGS=-D warnings (set by the recipe).
+      - run: just docs
 
   # docs.rs builds with nightly, all features and `--cfg docsrs` (see
   # `[package.metadata.docs.rs]`); a failure there only shows after publishing.
   docs-rs:
     runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: --cfg docsrs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
       - run: rustup toolchain install nightly --profile minimal --no-self-update
-      - run: cargo +nightly doc --no-deps --all-features
+      # With RUSTDOCFLAGS=--cfg docsrs (set by the recipe).
+      - run: just docs-rs
 
   no_std:
     runs-on: ubuntu-latest
@@ -91,14 +116,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
-      - run: rustup target add thumbv6m-none-eabi
-      - run: cargo build --lib --target thumbv6m-none-eabi --no-default-features
-      # Default features: the library builds (a binary would need a global allocator).
-      - run: cargo build --lib --target thumbv6m-none-eabi
-      # A no_main binary using only the core, with `default-features = false`:
-      # it must link without a `#[global_allocator]`.
-      - run: cargo build --release --target thumbv6m-none-eabi --manifest-path ci/fw-stub/Cargo.toml
+      # The recipe adds the thumbv6m-none-eabi target, then builds the core
+      # without default features, the library with them (a binary would need
+      # a global allocator), and a no_main firmware stub using only the core
+      # (`default-features = false`), which must link without a
+      # `#[global_allocator]`.
+      - run: just no-std
 
   minimal-versions:
     runs-on: ubuntu-latest
@@ -106,11 +136,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # `just` from its release, checked against the hash in the action's
+      # manifest; never built or fetched any other way (fallback: none).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+          fallback: none
       - run: rustup toolchain install nightly 1.85 --profile minimal --no-self-update
-      # Rewrites Cargo.lock with the lowest versions Cargo.toml allows for the
-      # direct dependencies (tracing 0.1.40); the checkout is thrown away after.
-      - run: cargo +nightly update -Z direct-minimal-versions
-      - run: cargo +1.85 test --all-features
+      # Tests on 1.85 after rewriting Cargo.lock with the lowest versions
+      # Cargo.toml allows for the direct dependencies (tracing 0.1.40); the
+      # recipe puts the lockfile back afterwards.
+      - run: just minimal-versions
 
   package:
     runs-on: ubuntu-latest
