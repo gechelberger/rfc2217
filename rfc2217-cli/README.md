@@ -206,8 +206,8 @@ type commands.txt | rfc2217 connect bridge.local -b 9600 > reply.txt
 `rfc2217 pty TARGET` (Linux and macOS) creates a pseudo-terminal, connects to
 the bridge and copies the data between the two, until the bridge closes the
 connection (exit code 1) or `rfc2217` is stopped. A program opens the pty as
-if it were a serial port. The macOS support follows the XNU sources but has not
-run on a Mac yet; Linux is tested.
+if it were a serial port. On macOS only the automated tests have run it (on
+GitHub's macOS runners); Linux is tested.
 
 The pty's own path (`/dev/pts/N` on Linux, `/dev/ttysNNN` on macOS) changes
 from run to run. `rfc2217 pty` prints it on stdout once the bridge has
