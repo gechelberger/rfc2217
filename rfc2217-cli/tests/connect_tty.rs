@@ -219,9 +219,12 @@ fn wait_raw(pty: &Pty) {
     }
 }
 
-/// The terminal has its settings from before the CLI ran.
+/// The terminal has its settings from before the CLI ran. Read through the
+/// master, which reaches the slave's settings: on macOS, the exit of the CLI
+/// (the session leader) revokes every descriptor of its controlling terminal,
+/// and `pty.slave` answers ENOTTY from then on.
 fn assert_restored(pty: &Pty) {
-    let now = tcgetattr(&pty.slave).expect("tcgetattr");
+    let now = tcgetattr(&pty.master).expect("tcgetattr");
     let before = &pty.before;
     assert_eq!(now.input_modes, before.input_modes);
     assert_eq!(now.output_modes, before.output_modes);
